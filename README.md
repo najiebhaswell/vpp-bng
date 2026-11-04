@@ -152,6 +152,31 @@ stalls the workers long enough to overflow the NIC RX rings (`rx_missed_errors`)
 echoes and sessions drop. With sessions up and steady there are no misses. For tens of thousands of subscribers
 keep the setup rate around 200-400/s.
 
+### Throughput
+
+TRex (`blaster/trex-run.sh` + `trex/pppoe-trex.py`) with 512 sessions set up by BNG Blaster: one upstream PPPoE
+and one downstream IPv4 stream per session, both directions on both 100G ports. TRex speaks no LACP, so the bond
+ran in static (xor) mode for these runs. Loss includes the policer of the one RADIUS user limited to 10M/20M.
+
+| Traffic | Offered | Forwarded | Loss |
+|---|---|---|---|
+| 1400 B, both directions | 96.1 Gbps (8.30 Mpps) | 8.29 Mpps | 0.20% |
+| 46 B IP, downstream only | 20.0 Mpps | 19.94 Mpps | 0.30% |
+| 46 B IP, upstream only | 12.0 Mpps | 11.98 Mpps | 0.14% |
+| 46 B IP, upstream only | 16.0 Mpps | 13.2 Mpps | 17.8% |
+| IMIX (46/576/1400, 7:4:1), both directions | 42 / 63 / 84 Gbps | 13.96 / 20.78 / 23.41 Mpps | 0.04% / 0.79% / 16% |
+
+The NIC cannot RSS-hash PPPoE, so all upstream PPPoE arrives on RX queue 0 of each port and is handed off to the
+other workers from there. With both queues 0 on the same worker (the default placement) upstream saturates at
+~8 Mpps and IMIX loses 10% at 42 Gbps; give each port's queue 0 its own worker:
+
+```
+set interface rx-placement cx5-1 queue 0 worker 6
+```
+
+1400-byte traffic is at the PCIe Gen3 limit of the single 2×100G card; downstream scales over all workers through
+RSS and did not reach its limit.
+
 Use `down-burst-factor=0.5` (or more) in `[shaper]` with VPP policers: they drop without a queue, and with the
 default 0.1 TCP gets about half of the configured rate.
 
