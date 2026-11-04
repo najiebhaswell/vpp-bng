@@ -8,20 +8,27 @@ NAME=$1; COUNT=$2; DS=$3; US=$4; LEN=$5; SECS=${6:-30}
 BIN=${BB_DPDK_BIN:-/opt/bngblaster-upstream/bin}; SOCK=/tmp/bb-tput.sock; R=/tmp/bb-tput
 OUT=$LAB/captures/$NAME; mkdir -p $OUT
 exec > >(tee $OUT/test.log) 2>&1
-sec() { echo; echo "################ $* ($(date +%T))"; }
+# SHOTDIR=<dir>, run inside xterm: dump the window ($WINDOWID) to <dir>/NN.xwd and clear it before each part
+N=0
+shot() {
+  [ -n "${SHOTDIR:-}" ] || return 0
+  sleep 1; N=$((N + 1)); xwd -silent -id $WINDOWID -out $SHOTDIR/$(printf %02d $N).xwd; clear > /dev/tty
+}
+sec() { case $1 in 1.*) ;; *) shot ;; esac; echo; echo "################ $* ($(date +%T))"; }
 bbq() { ssh $BB "bash -s" <<< "$1"; }
 cli() { bbq "sudo $BIN/bngblaster-cli $SOCK $*"; }
 counter() { cli session-counters 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['session-counters'].get('$1', 0))" 2>/dev/null || echo 0; }
 
-python3 - "$LAB/blaster/cap-pppoe.json" "$COUNT" "$DS" "$US" "$LEN" > $OUT/config.json <<'EOF'
-import json, sys
+# CFG_BASE: Blaster profile to start from (default blaster/cap-pppoe.json, LAG over both ports)
+python3 - "${CFG_BASE:-$LAB/blaster/cap-pppoe.json}" "$COUNT" "$DS" "$US" "$LEN" > $OUT/config.json <<'EOF'
+import json, os, sys
 c = json.load(open(sys.argv[1]))
 n, ds, us, ln = (int(x) for x in sys.argv[2:6])
 c["sessions"].update({"count": n, "start-rate": 400, "stop-rate": 400, "max-outstanding": 1600})
 c.pop("session-traffic", None)
 c["traffic"] = {"autostart": False}
 for link in c["interfaces"]["links"]:
-    link.update({"rx-threads": 4, "tx-threads": 6})
+    link.update({"rx-threads": int(os.environ.get("RX_THREADS", 4)), "tx-threads": int(os.environ.get("TX_THREADS", 6))})
 c["streams"] = [s for s in (
     {"name": "DS", "stream-group-id": 1, "type": "ipv4", "direction": "downstream", "pps": ds, "length": ln},
     {"name": "US", "stream-group-id": 1, "type": "ipv4", "direction": "upstream", "pps": us, "length": ln},
@@ -57,15 +64,17 @@ import json, sys
 d = [i for i in json.load(sys.stdin)['interfaces'] if i['name'] != 'lag0']
 print(sum(i.get('tx-packets', 0) for i in d), sum(i.get('rx-packets', 0) for i in d))"; }
 # router NIC packets received/sent on both bond members, as "rx tx"
-brpkts() { ssh $BR 'for i in cx5-0 cx5-1; do sudo vppctl show hardware $i; done' | awk '/rx_good_packets/ {r += $2} /tx_good_packets/ {t += $2} END {print r + 0, t + 0}'; }
-read TX0 RX0 <<< "$(bbpkts)"; read BRX0 BTX0 <<< "$(brpkts)"; T0=$(date +%s.%N)
+brpkts() { ssh $BR 'for i in cx5-0 cx5-1; do sudo vppctl show hardware $i; done' | awk '/rx_good_packets/ {r += $2} /tx_good_packets/ {t += $2} /rx_good_bytes/ {rb += $2} /tx_good_bytes/ {tb += $2} END {print r + 0, t + 0, rb + 0, tb + 0}'; }
+read TX0 RX0 <<< "$(bbpkts)"; read BRX0 BTX0 BRB0 BTB0 <<< "$(brpkts)"; T0=$(date +%s.%N)
 for i in $(seq 1 $(( SECS / 5 ))); do
   sleep 5
-  read TX1 RX1 <<< "$(bbpkts)"; read BRX1 BTX1 <<< "$(brpkts)"; T1=$(date +%s.%N)
+  read TX1 RX1 <<< "$(bbpkts)"; read BRX1 BTX1 BRB1 BTB1 <<< "$(brpkts)"; T1=$(date +%s.%N)
   D=$(echo "$T1 - $T0" | bc)
-  printf 'blaster tx %9d rx %9d pps | router nic rx %9d tx %9d pps\n' $(echo "($TX1 - $TX0) / $D" | bc) $(echo "($RX1 - $RX0) / $D" | bc) \
-    $(echo "($BRX1 - $BRX0) / $D" | bc) $(echo "($BTX1 - $BTX0) / $D" | bc)
-  TX0=$TX1; RX0=$RX1; BRX0=$BRX1; BTX0=$BTX1; T0=$T1
+  printf 'blaster tx %9d rx %9d pps | router nic rx %9d pps %6.2f Gbps, tx %9d pps %6.2f Gbps\n' \
+    $(echo "($TX1 - $TX0) / $D" | bc) $(echo "($RX1 - $RX0) / $D" | bc) \
+    $(echo "($BRX1 - $BRX0) / $D" | bc) $(echo "($BRB1 - $BRB0) * 8 / $D / 1000000000" | bc -l) \
+    $(echo "($BTX1 - $BTX0) / $D" | bc) $(echo "($BTB1 - $BTB0) * 8 / $D / 1000000000" | bc -l)
+  TX0=$TX1; RX0=$RX1; BRX0=$BRX1; BTX0=$BTX1; BRB0=$BRB1; BTB0=$BTB1; T0=$T1
 done
 sec "3. VPP while the traffic runs"
 ssh $BR 'sudo bash -s' <<'EOS'
@@ -97,3 +106,4 @@ cli terminate >/dev/null
 for i in $(seq 1 600); do bbq "pgrep -x bngblaster >/dev/null" || break; sleep 1; done
 ssh $BB "sudo cat $R.out" > $OUT/bngblaster.out
 grep -E -A12 'Stream Traffic|Traffic Streams' $OUT/bngblaster.out | head -30
+shot

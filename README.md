@@ -101,7 +101,9 @@ use the host's normal network. `ACCEL_CONF=/etc/accel-ppp-lab-radius.conf ./lab-
 **Physical** (`lab-phys-up.sh`): BNG Blaster on a separate host, cabled to the two bond members, with its
 own LACP LAG. The DP sides are new `BondEthernet0` sub-interfaces: VLAN 300 for PPPoE, VLAN 301 for the network
 side (172.31.98.1/30), and with `QINQ=` one per S/C pair. The CP sides are sub-interfaces with the same tags on a
-plain tap (`pb` in the root netns). `lab-phys-down.sh` removes only what the up script added.
+plain tap (`pb` in the root netns). `lab-phys-down.sh` removes only what the up script added. `ACCESS_IF=cx5-0
+NET_IF=cx5-1` puts the sub-interfaces on the ports themselves instead of the bond; thousands of them are created
+in one batch (10k QinQ pairs in ~30 s).
 
 ## RADIUS test subscribers
 
@@ -176,6 +178,31 @@ set interface rx-placement cx5-1 queue 0 worker 6
 
 1400-byte traffic is at the PCIe Gen3 limit of the single 2×100G card; downstream scales over all workers through
 RSS and did not reach its limit.
+
+**10k QinQ sessions on the physical ports.** Subscribers on `cx5-0` directly (no bond), S-VLAN 100–104 (802.1Q)
+and 200–204 (802.1ad) × C-VLAN 1–1000, network on `cx5-1` VLAN 301:
+
+```
+ACCESS_IF=cx5-0 NET_IF=cx5-1 PPPOE_VLAN=none QINQ="100-104:dot1q:1-1000 200-204:dot1ad:1-1000" \
+  CFG_BASE=blaster/qinq-10k.json blaster/trex-run.sh tput-trex-qinq 10000 "1400 bi 4.46mpps/0.893mpps"
+```
+
+With separate access and network ports, TRex sends one stream per direction whose field engine steps through the
+sessions (MAC, S/C tags, PPPoE session id, IP) packet by packet, so every session gets the same rate and the
+profile loads at once; `<down mult>/<up mult>` sets the directions separately. Rates per session, 1400-byte IP
+packets:
+
+| Downstream / upstream | Received per session | Loss down / up |
+|---|---|---|
+| 5 / 5 Mbit/s (4.46 Mpps each way offered) | 4.66 / 4.66 Mbit/s (TRex max 4.16 Mpps per port, 96 Gbps) | 0.04% / 0.14% |
+| 5 / 1 Mbit/s | 4.99 / 1.0 Mbit/s | 0.045% / 0.094% |
+| 5 / 2.5 Mbit/s | 4.99 / 2.49 Mbit/s | 0.091% / 0.169% |
+| 5 / 4 Mbit/s | 4.99 / 3.99 Mbit/s | 0.042% / 0.122% |
+
+5 Mbit/s both ways for 10k sessions needs ~104 Gbps L1 per direction through one card; the CX5 Ex runs at PCIe
+Gen3 x16 on both hosts, so that needs the access and network ports on separate cards. Upstream loss is
+`rx_missed` on queue 0 of `cx5-0`, which takes all upstream PPPoE (~4 Mpps) before handing it off.
+BNG Blaster's own DPDK streams (`blaster/tput-run.sh`) reached only ~1.9 Mpps for the same setup.
 
 ### Churn
 

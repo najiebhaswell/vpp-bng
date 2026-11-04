@@ -1,0 +1,81 @@
+{
+    "interfaces": {
+        "io-mode": "dpdk",
+        "links": [
+            {
+                "interface": "0000:3b:00.0",
+                "rx-threads": 4,
+                "tx-threads": 8
+            },
+            {
+                "interface": "0000:3b:00.1",
+                "rx-threads": 4,
+                "tx-threads": 8
+            }
+        ],
+        "network": {
+            "interface": "0000:3b:00.1",
+            "vlan": 301,
+            "address": "172.31.98.2/30",
+            "gateway": "172.31.98.1"
+        },
+        "access": [
+            {
+                "interface": "0000:3b:00.0",
+                "type": "pppoe",
+                "vlan-mode": "1:1",
+                "outer-vlan-min": 100,
+                "outer-vlan-max": 104,
+                "inner-vlan-min": 1,
+                "inner-vlan-max": 1000,
+                "username": "@SUB_USER@{session-global}",
+                "password": "@SUB_PASS@",
+                "stream-group-id": 1
+            },
+            {
+                "interface": "0000:3b:00.0",
+                "type": "pppoe",
+                "vlan-mode": "1:1",
+                "qinq": true,
+                "outer-vlan-min": 200,
+                "outer-vlan-max": 204,
+                "inner-vlan-min": 1,
+                "inner-vlan-max": 1000,
+                "username": "@SUB_USER@{session-global}",
+                "password": "@SUB_PASS@",
+                "stream-group-id": 1
+            }
+        ]
+    },
+    "sessions": {
+        "count": 10000,
+        "start-rate": 400,
+        "stop-rate": 400,
+        "max-outstanding": 1600
+    },
+    "pppoe": {
+        "reconnect": false,
+        "discovery-timeout": 2,
+        "discovery-retry": 10
+    },
+    "ppp": {
+        "mru": 1492,
+        "authentication": {
+            "protocol": "CHAP"
+        },
+        "lcp": {
+            "conf-request-timeout": 5,
+            "conf-request-retry": 10,
+            "keepalive-interval": 30,
+            "keepalive-retry": 3
+        },
+        "ipcp": {
+            "enable": true,
+            "request-dns1": false,
+            "request-dns2": false
+        },
+        "ip6cp": {
+            "enable": false
+        }
+    }
+}

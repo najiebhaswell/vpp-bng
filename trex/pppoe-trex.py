@@ -5,6 +5,7 @@
 #   pppoe-trex.py <sessions.json> <ip-size>[,<ip-size>|imix...] <up|down|bi> <mult per port> [window-seconds]
 # sessions.json: {"bng-mac": ..., "access-vlan": 300, "network-vlan": 301, "network-ip": "172.31.98.2",
 #                 "sessions": [{"mac": ..., "sid": <pppoe session id>, "ip": ...}, ...]}
+# With access-port/network-port, <mult> may be <downstream mult>/<upstream mult>.
 # Sizes are IPv4 packet lengths; imix gives sessions 46/576/1400 byte packets in a 7:4:1 ratio.
 import json
 import os
@@ -48,6 +49,67 @@ def downstream(s, ip_len):
     return STLStream(packet=STLPktBuilder(pkt=pad(pkt, ip_len), vm=udp_vm("UDP.sport")), mode=STLTXCont(pps=1))
 
 
+def ip_int(a):
+    return int.from_bytes(bytes(int(x) for x in a.split(".")), "big")
+
+
+def lockstep(fields, ip_offset):
+    # one value list per field, all as long as the session list and stepped together: packet n belongs to session n,
+    # so a single stream gives every session the same rate (thousands of streams take TRex minutes to load)
+    insts = []
+    for name, size, offset, values in fields:
+        insts += [STLVmFlowVar(name=name, size=size, op="inc", value_list=values),
+                  STLVmWrFlowVar(fv_name=name, pkt_offset=offset)]
+    insts += [STLVmFlowVar(name="sp", min_value=1024, max_value=65000, size=2, op="random"),
+              STLVmWrFlowVar(fv_name="sp", pkt_offset=ip_offset + 20), STLVmFixIpv4(offset=ip_offset)]
+    return STLScVmRaw(insts)
+
+
+def upstream_split(group, ip_len):
+    # sessions with "vlans": [[tpid, vid], ...] (outer first), all with the same number of tags
+    n = len(group[0]["vlans"])
+    pkt = Ether(src=group[0]["mac"], dst=cfg["bng-mac"])
+    for _ in range(n):
+        pkt = pkt / Dot1Q()
+    pkt = pkt / PPPoE(sessionid=1) / PPP(proto=0x0021) / IP(src="0.0.0.0", dst=cfg["network-ip"]) / \
+        UDP(sport=1024, dport=5001, chksum=0)
+    mac = [int(s["mac"].replace(":", ""), 16) for s in group]
+    fields = [("mh", 2, 6, [m >> 32 for m in mac]), ("ml", 4, 8, [m & 0xffffffff for m in mac])]
+    for t in range(n):
+        fields += [(f"tp{t}", 2, 12 + 4 * t, [s["vlans"][t][0] for s in group]),
+                   (f"vid{t}", 2, 14 + 4 * t, [s["vlans"][t][1] for s in group])]
+    fields += [("sid", 2, 16 + 4 * n, [s["sid"] for s in group]),
+               ("src", 4, 34 + 4 * n, [ip_int(s["ip"]) for s in group])]
+    return STLStream(packet=STLPktBuilder(pkt=pad(pkt, ip_len), vm=lockstep(fields, 22 + 4 * n)),
+                     mode=STLTXCont(pps=len(group)))
+
+
+def downstream_split(ip_len):
+    pkt = (Ether(dst=cfg["network-mac"]) / Dot1Q(vlan=cfg["network-vlan"]) /
+           IP(src=cfg["network-ip"], dst="0.0.0.0") / UDP(sport=1024, dport=5002, chksum=0))
+    fields = [("dst", 4, 34, [ip_int(s["ip"]) for s in cfg["sessions"]])]
+    return STLStream(packet=STLPktBuilder(pkt=pad(pkt, ip_len), vm=lockstep(fields, 18)),
+                     mode=STLTXCont(pps=len(cfg["sessions"])))
+
+
+# "access-port"/"network-port" in sessions.json: subscribers on one port, network on the other, one stream per
+# direction (per tag depth upstream). Without: per-session streams spread over both ports of a static bond.
+SPLIT = "access-port" in cfg
+
+
+def split_streams(size):
+    acc, net = cfg["access-port"], cfg["network-port"]
+    streams = {acc: [], net: []}
+    if MODE in ("up", "bi"):
+        depth = {}
+        for s in cfg["sessions"]:
+            depth.setdefault(len(s["vlans"]), []).append(s)
+        streams[acc] = [upstream_split(g, int(size)) for g in depth.values()]
+    if MODE in ("down", "bi"):
+        streams[net] = [downstream_split(int(size))]
+    return streams
+
+
 c = STLClient(server="127.0.0.1")
 c.connect()
 c.reset(ports=[0, 1])
@@ -57,7 +119,9 @@ for size in SIZES:
     c.reset(ports=[0, 1])
     c.set_port_attr(ports=[0, 1], promiscuous=True)
     streams = {0: [], 1: []}
-    for i, s in enumerate(cfg["sessions"]):
+    if SPLIT:
+        streams = split_streams(size)
+    for i, s in enumerate([] if SPLIT else cfg["sessions"]):
         ip_len = IMIX[i % len(IMIX)] if size == "imix" else int(size)
         if MODE in ("up", "bi"):
             streams[i % 2].append(upstream(s, ip_len))
@@ -68,7 +132,14 @@ for size in SIZES:
             c.add_streams(streams[p], ports=[p])
     tx_ports = [p for p in (0, 1) if streams[p]]
     c.clear_stats()
-    c.start(ports=tx_ports, mult=MULT, force=True)
+    if SPLIT and "/" in MULT:
+        # <downstream mult>/<upstream mult>
+        down, up = MULT.split("/")
+        for p, m in ((cfg["network-port"], down), (cfg["access-port"], up)):
+            if streams[p]:
+                c.start(ports=[p], mult=m, force=True)
+    else:
+        c.start(ports=tx_ports, mult=MULT, force=True)
     time.sleep(WARMUP)
     a = c.get_stats(); ta = time.time()
     time.sleep(WINDOW)
@@ -87,5 +158,12 @@ for size in SIZES:
     r["offered_gbps_l1"] = round(txb / dt / 1e9, 2)
     r["received_mpps"] = round(rx / dt / 1e6, 3)
     r["loss_pct"] = round(100.0 * (tx - rx) / tx, 3) if tx else None
+    if SPLIT:
+        acc, net = cfg["access-port"], cfg["network-port"]
+        for d, src, dst in (("up", acc, net), ("down", net, acc)):
+            t = b[src]["opackets"] - a[src]["opackets"]; rcv = b[dst]["ipackets"] - a[dst]["ipackets"]
+            if t:
+                r[f"{d}_loss_pct"] = round(100.0 * (t - rcv) / t, 3)
+                r[f"{d}_mbps_per_session"] = round(rcv * (int(size) * 8) / dt / 1e6 / len(cfg["sessions"]), 2)
     print(json.dumps(r), flush=True)
 c.disconnect()
