@@ -204,6 +204,37 @@ Gen3 x16 on both hosts, so that needs the access and network ports on separate c
 `rx_missed` on queue 0 of `cx5-0`, which takes all upstream PPPoE (~4 Mpps) before handing it off.
 BNG Blaster's own DPDK streams (`blaster/tput-run.sh`) reached only ~1.9 Mpps for the same setup.
 
+**Intel E810 with the comms DDP package.** The E810 parses PPPoE once the comms DDP package is loaded, and DPDK's
+ice PMD then hashes PPPoE by the inner IPv4 header whenever `ipv4` RSS is requested (VPP's default), so upstream
+PPPoE is spread over all RX queues by the NIC and needs no worker handoff (`HANDOFF=0 trex-run.sh`). Load it for
+one card only with the device-specific file name, then reset the card (or reboot) so the new package replaces the
+one already on it:
+
+```
+cp ice_comms-1.3.63.0.pkg /lib/firmware/updates/intel/ice/ddp/
+ln -s ice_comms-1.3.63.0.pkg /lib/firmware/updates/intel/ice/ddp/ice-<serial>.pkg   # serial: dmesg | grep ice-
+```
+
+VPP has to see the kernel interface down, or it skips the device. Subscribers on one E810 port (10k QinQ
+sessions, 46-byte IP upstream, no handoff), network on a CX5 port:
+
+| Upstream | Loss, RX/TX ring 1024 | Loss, RX/TX ring 4096 |
+|---|---|---|
+| 6 Mpps | 0.063% | 0.003% |
+| 10 Mpps | 0.092% | 0.001% |
+| 14 Mpps | 0.111% | 0.019% |
+| 18 Mpps | 0.134% | 0.055% |
+| 5 down / 4 up Mbit/s per session, 1400 B (93 Gbps) | 0.082% / 0.062% | 0.0% / 0.0% |
+
+At 18 Mpps each of the 12 workers takes ~1.5 Mpps and `pppoe-input` costs ~270 clocks/packet (544–795 plus
+~400–500 for the handoff with the CX5). Use 4096 descriptors:
+
+```
+dpdk {
+  dev default { num-rx-desc 4096 num-tx-desc 4096 }
+}
+```
+
 ### Churn
 
 10k sessions with 1 pps of traffic each; the router terminates random sessions (`accel-cmd terminate`, as a

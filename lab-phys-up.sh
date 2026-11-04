@@ -14,6 +14,8 @@ set -eu
 . "$(dirname "$0")/lab-env.sh"
 PV=${PPPOE_VLAN:-300}; NV=${NET_VLAN:-301}; ACC=${ACCESS_IF:-BondEthernet0}; NET=${NET_IF:-$ACC}
 MAC=$(vppctl show hardware-interfaces $ACC | awk '/Ethernet address/{print $3; exit}')
+# a port outside the router config (e.g. a NIC added for the lab) comes up admin down
+vppctl set int state $ACC up; vppctl set int state $NET up
 [ -e /run/netns/rootns ] || ip netns attach rootns 1
 vppctl create tap id 950 host-if-name pb host-mac-addr $MAC host-ns rootns >/dev/null
 vppctl set int state tap950 up

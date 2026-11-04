@@ -8,6 +8,8 @@
 # subscribers on port 0 (PPPOE_VLAN/QINQ as for lab-phys-up.sh), network on port 1, one stream per direction.
 #   ACCESS_IF=cx5-0 NET_IF=cx5-1 PPPOE_VLAN=none QINQ="100-104:dot1q:1-1000 200-204:dot1ad:1-1000" \
 #     CFG_BASE=blaster/qinq-10k.json trex-run.sh tput-trex-qinq 10000 "1400 bi 4.46mpps"
+# HANDOFF=0 takes worker-handoff off the access port, for NICs that spread PPPoE over their RX queues themselves
+# (E810 with the comms DDP package).
 # BNG Blaster sets the sessions up (CFG_BASE, default blaster/cap-pppoe.json as a static LAG) and is then killed
 # (no PADT); with LCP echo off the sessions stay. Output: captures/<run-name>/test.log with one JSON result per test
 # and the router's view of it. SHOTDIR=<dir>, run inside xterm: window dumps <dir>/NN.xwd as in tput-run.sh.
@@ -30,7 +32,9 @@ bbq() { ssh $BB "bash -s" <<< "$1"; }
 brq() { ssh $BR "sudo bash -s" <<< "$1"; }
 cli() { bbq "sudo $BIN/bngblaster-cli $SOCK $*"; }
 counter() { cli session-counters 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['session-counters'].get('$1', 0))" 2>/dev/null || echo 0; }
-missed() { brq "for i in cx5-0 cx5-1; do vppctl show hardware \$i; done" | awk '/rx_missed_errors/ {s += $2} END {print s + 0}'; }
+# physical ports whose rx_missed counts: the bond members, or the access and network ports
+PORTS="cx5-0 cx5-1"; [ $ACC = BondEthernet0 ] || PORTS="$ACC $NET"
+missed() { brq "for i in $PORTS; do vppctl show hardware \$i; done" | awk '/rx_missed_errors/ {s += $2} END {print s + 0}'; }
 
 sec "0. Router"
 if [ $ACC = BondEthernet0 ]; then
@@ -39,8 +43,12 @@ if [ $ACC = BondEthernet0 ]; then
   [ "$MODE" = xor ] || { echo "the bond must be in xor (static) mode: TRex does not speak LACP"; exit 1; }
 fi
 brq "$LABENV ACCEL_TEMPLATE=accel-ppp-lab-tput.conf bash $BR_DIR/lab-phys-up.sh | tail -1
-vppctl show int features $ACC | grep -q worker-handoff || vppctl set interface handoff $ACC workers 0-11
-for i in cx5-0 cx5-1 BondEthernet0; do echo \"\$i handoff \$(vppctl show int features \$i | sed -n '/^device-input:/,/^\$/p' | grep -c worker-handoff)\"; done"
+if [ ${HANDOFF:-1} = 1 ]; then
+  vppctl show int features $ACC | grep -q worker-handoff || vppctl set interface handoff $ACC workers 0-11
+else
+  vppctl show int features $ACC | grep -q worker-handoff && vppctl set interface handoff $ACC workers 0-11 disable
+fi
+for i in \$(echo $PORTS BondEthernet0 | tr ' ' '\n' | sort -u); do echo \"\$i handoff \$(vppctl show int features \$i | sed -n '/^device-input:/,/^\$/p' | grep -c worker-handoff)\"; done"
 bbq "sudo systemctl stop trex 2>/dev/null; sudo systemctl reset-failed trex 2>/dev/null; true"
 
 sec "1. $COUNT sessions through BNG Blaster"
@@ -117,6 +125,7 @@ for t in "$@"; do
   sleep $(( WINDOW - 3 ))
   brq "vppctl show runtime > /tmp/rt.txt
 for i in $ACC $NET; do vppctl show hardware \$i | awk -v i=\$i '/rx_good_packets|tx_good_packets|rx_good_bytes|tx_good_bytes/ {v[\$1] = \$2} END {printf \"%-14s rx %6.2f Mpps %6.2f Gbps   tx %6.2f Mpps %6.2f Gbps   (avg over %ds)\\n\", i, v[\"rx_good_packets\"] / $((WINDOW - 3)) / 1e6, v[\"rx_good_bytes\"] * 8 / $((WINDOW - 3)) / 1e9, v[\"tx_good_packets\"] / $((WINDOW - 3)) / 1e6, v[\"tx_good_bytes\"] * 8 / $((WINDOW - 3)) / 1e9, $((WINDOW - 3))}'; done | sort -u
+vppctl show hardware $ACC | awk '\$1 ~ /^rx_q[0-9]+_packets\$/ {sub(/_packets/, \"\", \$1); printf \"%s %.2fM  \", \$1, \$2 / $((WINDOW - 3)) / 1e6} END {print \"pps per RX queue of $ACC\"}' | fold -w 200
 awk '/^Thread/ {t = \$3} /^  vector rates in/ {printf \"%-10s in %s\\n\", t, \$4}' /tmp/rt.txt | sed 's/,//' | paste -sd' ' | fold -w 200
 awk '\$1 == \"worker-handoff\" || \$1 == \"pppoe-input\" || \$1 == \"ip4-midchain\" || \$1 == \"policer-output\" || \$1 == \"policer-input\" {v[\$1] += \$3; c[\$1] += \$3 * \$6} END {for (k in v) if (v[k]) printf \"%-15s %12d vectors %7.1f clocks/pkt\\n\", k, v[k], c[k] / v[k]}' /tmp/rt.txt
 vppctl show errors | grep -vE '^\s+0 ' | grep -iE 'drop|full|miss|congest|no free|violate|exceed' | head -6"
