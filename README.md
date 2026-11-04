@@ -177,6 +177,16 @@ set interface rx-placement cx5-1 queue 0 worker 6
 1400-byte traffic is at the PCIe Gen3 limit of the single 2×100G card; downstream scales over all workers through
 RSS and did not reach its limit.
 
+### Churn
+
+10k sessions with 1 pps of traffic each; the router terminates random sessions (`accel-cmd terminate`, as a
+RADIUS Disconnect would) and BNG Blaster logs them in again through RADIUS (`blaster/churn-run.sh`):
+
+| Churn for 120 s | Terminated / logged in again | Lowest number of sessions up | NIC rx_missed | Afterwards |
+|---|---|---|---|---|
+| 100/s | 12000 / 11847 | ~9870 | 0 | 10000/10000 up, 20000/20000 flows, no leaked interface, policer or route |
+| 300/s | 36000 / 33275 | 8084 (~1250 logins queued) | 0 | 10000/10000 up, 20000/20000 flows, no leaks |
+
 Use `down-burst-factor=0.5` (or more) in `[shaper]` with VPP policers: they drop without a queue, and with the
 default 0.1 TCP gets about half of the configured rate.
 
