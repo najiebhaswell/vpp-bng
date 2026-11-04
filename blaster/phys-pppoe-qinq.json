@@ -1,0 +1,77 @@
+{
+    "interfaces": {
+        "network": {
+            "interface": "lag0",
+            "vlan": 301,
+            "address": "172.31.98.2/30",
+            "gateway": "172.31.98.1"
+        },
+        "access": [
+            {
+                "interface": "lag0",
+                "type": "pppoe",
+                "vlan-mode": "1:1",
+                "outer-vlan": 100,
+                "inner-vlan-min": 10,
+                "inner-vlan-max": 59,
+                "username": "@SUB_USER@{i1}",
+                "password": "@SUB_PASS@",
+                "i1-start": 2001
+            },
+            {
+                "interface": "lag0",
+                "type": "pppoe",
+                "vlan-mode": "1:1",
+                "qinq": true,
+                "outer-vlan": 200,
+                "inner-vlan-min": 10,
+                "inner-vlan-max": 59,
+                "username": "@SUB_USER@{i1}",
+                "password": "@SUB_PASS@",
+                "i1-start": 3001
+            }
+        ],
+        "lag": [
+            {
+                "interface": "lag0",
+                "lacp": true,
+                "lacp-timeout-short": true
+            }
+        ],
+        "links": [
+            {
+                "interface": "ens1f0np0",
+                "lag-interface": "lag0"
+            },
+            {
+                "interface": "ens1f1np1",
+                "lag-interface": "lag0"
+            }
+        ]
+    },
+    "sessions": {
+        "count": 100,
+        "start-rate": 50,
+        "stop-rate": 50
+    },
+    "pppoe": {
+        "reconnect": false
+    },
+    "ppp": {
+        "authentication": {
+            "protocol": "PAP"
+        },
+        "ipcp": {
+            "enable": true,
+            "request-dns1": false,
+            "request-dns2": false
+        },
+        "ip6cp": {
+            "enable": false
+        }
+    },
+    "session-traffic": {
+        "autostart": true,
+        "ipv4-pps": 10
+    }
+}

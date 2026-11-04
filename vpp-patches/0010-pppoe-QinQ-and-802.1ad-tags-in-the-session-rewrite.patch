@@ -1,0 +1,116 @@
+From 2944c2edb47a4873e96ea0bff76dd267b81b8296 Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:23:08 +0700
+Subject: [PATCH] pppoe: QinQ and 802.1ad tags in the session rewrite
+
+pppoe_build_rewrite() and pppoe_update_adj() only knew single dot1q
+sub-interfaces: sessions learned on a QinQ sub-interface were encapsulated
+without any tag and a dot1ad outer tag got TPID 0x8100. Count the tags of
+the encap interface in one helper and write outer (dot1q or dot1ad) and
+inner tags.
+---
+ src/plugins/pppoe/pppoe.c | 60 ++++++++++++++++++++++-----------------
+ 1 file changed, 34 insertions(+), 26 deletions(-)
+
+diff --git a/src/plugins/pppoe/pppoe.c b/src/plugins/pppoe/pppoe.c
+index 418e38c87..c40716b15 100644
+--- a/src/plugins/pppoe/pppoe.c
++++ b/src/plugins/pppoe/pppoe.c
+@@ -82,6 +82,17 @@ format_pppoe_header_with_length (u8 * s, va_list * args)
+   return s;
+ }
+ 
++/* VLAN tags the session encap interface puts in front of the PPPoE header */
++static u32
++pppoe_encap_n_tags (vnet_sw_interface_t *si)
++{
++  if (si->type != VNET_SW_INTERFACE_TYPE_SUB)
++    return 0;
++  if (si->sub.eth.flags.two_tags)
++    return 2;
++  return si->sub.eth.flags.one_tag;
++}
++
+ static u8 *
+ pppoe_build_rewrite (vnet_main_t * vnm,
+ 		     u32 sw_if_index,
+@@ -98,15 +109,10 @@ pppoe_build_rewrite (vnet_main_t * vnm,
+   session_id = pem->session_index_by_sw_if_index[sw_if_index];
+   t = pool_elt_at_index (pem->sessions, session_id);
+ 
+-  int len = sizeof (pppoe_header_t) + sizeof (ethernet_header_t);
+   si = vnet_get_sw_interface (vnm, t->encap_if_index);
+-  if (si->type == VNET_SW_INTERFACE_TYPE_SUB)
+-    {
+-      if (si->sub.eth.flags.one_tag == 1)
+-	{
+-	  len += sizeof (ethernet_vlan_header_t);
+-	}
+-    }
++  u32 n_tags = pppoe_encap_n_tags (si);
++  int len = sizeof (pppoe_header_t) + sizeof (ethernet_header_t) +
++	    n_tags * sizeof (ethernet_vlan_header_t);
+ 
+   vec_validate_aligned (rw, len - 1, CLIB_CACHE_LINE_BYTES);
+ 
+@@ -114,20 +120,29 @@ pppoe_build_rewrite (vnet_main_t * vnm,
+   eth_hdr->type = clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION);
+   pppoe = (pppoe_header_t *) (eth_hdr + 1);
+ 
+-  if (si->type == VNET_SW_INTERFACE_TYPE_SUB)
++  if (n_tags)
+     {
+-      if (si->sub.eth.flags.one_tag == 1)
++      ethernet_vlan_header_t *vlan = (ethernet_vlan_header_t *) (eth_hdr + 1);
++
++      eth_hdr->type = clib_host_to_net_u16 (
++	si->sub.eth.flags.dot1ad ? ETHERNET_TYPE_DOT1AD : ETHERNET_TYPE_VLAN);
++      vlan->priority_cfi_and_id =
++	clib_host_to_net_u16 (si->sub.eth.outer_vlan_id);
++      vlan->type = clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION);
++
++      /* QinQ: the inner tag is always 802.1q */
++      if (n_tags == 2)
+ 	{
+-	  eth_hdr->type = clib_host_to_net_u16 (ETHERNET_TYPE_VLAN);
+-	  ethernet_vlan_header_t *vlan =
+-	    (ethernet_vlan_header_t *) (eth_hdr + 1);
+-	  vlan->type = clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION);
++	  vlan->type = clib_host_to_net_u16 (ETHERNET_TYPE_VLAN);
++	  vlan++;
+ 	  vlan->priority_cfi_and_id =
+-	    clib_host_to_net_u16 (si->sub.eth.outer_vlan_id);
+-	  pppoe = (pppoe_header_t *) (vlan + 1);
++	    clib_host_to_net_u16 (si->sub.eth.inner_vlan_id);
++	  vlan->type = clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION);
+ 	}
+-      si = vnet_get_sw_interface (vnm, si->sup_sw_if_index);
++      pppoe = (pppoe_header_t *) (vlan + 1);
+     }
++  if (si->type == VNET_SW_INTERFACE_TYPE_SUB)
++    si = vnet_get_sw_interface (vnm, si->sup_sw_if_index);
+ 
+   // set the right mac addresses
+   hi = vnet_get_hw_interface (vnm, si->hw_if_index);
+@@ -189,16 +204,9 @@ pppoe_update_adj (vnet_main_t * vnm, u32 sw_if_index, adj_index_t ai)
+   session_id = pem->session_index_by_sw_if_index[sw_if_index];
+   t = pool_elt_at_index (pem->sessions, session_id);
+ 
+-  uword len = sizeof (ethernet_header_t);
+-
+   si = vnet_get_sw_interface (vnm, t->encap_if_index);
+-  if (si->type == VNET_SW_INTERFACE_TYPE_SUB)
+-    {
+-      if (si->sub.eth.flags.one_tag == 1)
+-	{
+-	  len += sizeof (ethernet_vlan_header_t);
+-	}
+-    }
++  uword len = sizeof (ethernet_header_t) +
++	      pppoe_encap_n_tags (si) * sizeof (ethernet_vlan_header_t);
+ 
+   switch (adj->lookup_next_index)
+     {
+-- 
+2.47.3
+

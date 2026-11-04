@@ -1,0 +1,212 @@
+From cc25d3db9891d280ba1edd4db0048b09d4b48c6d Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:42:06 +0700
+Subject: [PATCH] pppoe: parse session packets behind any VLAN tags
+
+pppoe-input re-parsed the frame from its start and only skipped one
+802.1q tag, so on QinQ or 802.1ad sub-interfaces every session packet
+(LCP before the VPP session exists, then data) was dropped as bad
+version/type. ethernet-input has already matched the sub-interface and
+left current_data at the PPPoE header, so take the header from there
+and the client MAC from l2_hdr_offset.
+---
+ src/plugins/pppoe/pppoe_decap.c | 103 ++++++--------------------------
+ 1 file changed, 18 insertions(+), 85 deletions(-)
+
+diff --git a/src/plugins/pppoe/pppoe_decap.c b/src/plugins/pppoe/pppoe_decap.c
+index 67426f3fe..cc8693756 100644
+--- a/src/plugins/pppoe/pppoe_decap.c
++++ b/src/plugins/pppoe/pppoe_decap.c
+@@ -113,7 +113,6 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 	  vlib_buffer_t * b0, * b1;
+ 	  u32 next0, next1;
+ 	  ethernet_header_t *h0, *h1;
+-	  ethernet_vlan_header_t *vlan0 = 0, *vlan1 = 0;
+           pppoe_header_t * pppoe0, * pppoe1;
+           u16 ppp_proto0 = 0, ppp_proto1 = 0;
+           pppoe_session_t * t0, * t1;
+@@ -122,7 +121,6 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 	  pppoe_entry_key_t key0, key1;
+ 	  pppoe_entry_result_t result0, result1;
+ 	  u32 bucket0, bucket1;
+-	  u16 type0, type1;
+ 
+ 	  /* Prefetch next iteration. */
+ 	  {
+@@ -153,35 +151,17 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+           error1 = 0;
+ 
+ 		  /* get client mac */
+-          vlib_buffer_reset(b0);
+-          h0 = vlib_buffer_get_current (b0);
+-
+-		  /* get pppoe header */
+-		  type0 = clib_net_to_host_u16(h0->type);
+-		  if(type0 == ETHERNET_TYPE_VLAN){
+-			  vlan0 = (ethernet_vlan_header_t *)(h0+1);
+-			  type0 = clib_net_to_host_u16(vlan0->type);
+-			  pppoe0 = (pppoe_header_t*)(vlan0+1);
+-			  if( type0 != ETHERNET_TYPE_PPPOE_DISCOVERY && type0 != ETHERNET_TYPE_PPPOE_SESSION ) {
+-				error0 = PPPOE_ERROR_BAD_VER_TYPE;
+-				result0.fields.session_index =
+-				  ~0; // avoid tracing random data
+-				next0 = PPPOE_INPUT_NEXT_DROP;
+-				goto trace0;
+-			  }
+-		  } else {
+-			  pppoe0 = (pppoe_header_t*)(h0+1);
+-		  }
++          /* ethernet-input left current_data at the PPPoE header, behind any
++             VLAN tags of the (sub-)interface, so QinQ and dot1ad work too */
++          pppoe0 = vlib_buffer_get_current (b0);
++          h0 = (ethernet_header_t *) (b0->data +
++                                         vnet_buffer (b0)->l2_hdr_offset);
+ 
+           ppp_proto0 = clib_net_to_host_u16(pppoe0->ppp_proto);          
+ 
+           /* Manipulate packet 0 */
+ 		  if (is_control_plane_packet(pppoe0, pem->is_pass_nd_and_dhcpv6))
+             {
+-		  vlan0 == 0 ?
+-	  	    vlib_buffer_advance(b0, sizeof(*h0))
+-	      :
+-	  	    vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*vlan0));
+ 	      error0 = PPPOE_ERROR_CONTROL_PLANE;
+ 	      next0 = PPPOE_INPUT_NEXT_CP_INPUT;
+ 	      result0.fields.session_index = ~0;
+@@ -203,10 +183,7 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 				  result0.fields.session_index);
+ 
+ 	  /* Pop Eth and PPPoE header */
+-	  vlan0 == 0 ?
+-	  	vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*pppoe0))
+-	  :
+-	  	vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*vlan0)+sizeof(*pppoe0));
++	  vlib_buffer_advance (b0, sizeof (*pppoe0));
+ 
+ 	  next0 = (ppp_proto0==PPP_PROTOCOL_ip4)?
+ 		  PPPOE_INPUT_NEXT_IP4_INPUT
+@@ -250,35 +227,17 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+             }
+ 
+           /* get client mac */
+-          vlib_buffer_reset(b1);
+-          h1 = vlib_buffer_get_current (b1);
+-
+-		  /* get pppoe header */
+-		  type1 = clib_net_to_host_u16(h1->type);
+-		  if(type1 == ETHERNET_TYPE_VLAN){
+-			  vlan1 = (ethernet_vlan_header_t *)(h1+1);
+-			  type1 = clib_net_to_host_u16(vlan1->type);
+-			  pppoe1 = (pppoe_header_t*)(vlan1+1);
+-			  if( type1 != ETHERNET_TYPE_PPPOE_DISCOVERY && type1 != ETHERNET_TYPE_PPPOE_SESSION ) {
+-				error1 = PPPOE_ERROR_BAD_VER_TYPE;
+-				result1.fields.session_index =
+-				  ~0; // avoid tracing random data
+-				next1 = PPPOE_INPUT_NEXT_DROP;
+-				goto trace1;
+-			  }
+-		  } else {
+-			  pppoe1 = (pppoe_header_t*)(h1+1);
+-		  }
++          /* ethernet-input left current_data at the PPPoE header, behind any
++             VLAN tags of the (sub-)interface, so QinQ and dot1ad work too */
++          pppoe1 = vlib_buffer_get_current (b1);
++          h1 = (ethernet_header_t *) (b1->data +
++                                         vnet_buffer (b1)->l2_hdr_offset);
+ 
+ 		  ppp_proto1 = clib_net_to_host_u16(pppoe1->ppp_proto);
+ 
+           /* Manipulate packet 1 */
+           if (is_control_plane_packet(pppoe1, pem->is_pass_nd_and_dhcpv6))
+             {
+-		  vlan1 == 0 ?
+-	  	    vlib_buffer_advance(b1, sizeof(*h1))
+-	      :
+-	  	    vlib_buffer_advance(b1, sizeof(*h1)+sizeof(*vlan1));
+ 	      error1 = PPPOE_ERROR_CONTROL_PLANE;
+ 	      next1 = PPPOE_INPUT_NEXT_CP_INPUT;
+ 	      result1.fields.session_index = ~0;
+@@ -299,10 +258,7 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 				  result1.fields.session_index);
+ 
+ 	  /* Pop Eth and PPPoE header */
+-	  vlan1 == 0 ?
+-	  	vlib_buffer_advance(b1, sizeof(*h1)+sizeof(*pppoe1))
+-	  :
+-	  	vlib_buffer_advance(b1, sizeof(*h1)+sizeof(*vlan1)+sizeof(*pppoe1));
++	  vlib_buffer_advance (b1, sizeof (*pppoe1));
+ 
+ 	  next1 = (ppp_proto1==PPP_PROTOCOL_ip4)?
+ 		  PPPOE_INPUT_NEXT_IP4_INPUT
+@@ -356,7 +312,6 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 	  vlib_buffer_t * b0;
+ 	  u32 next0;
+ 	  ethernet_header_t *h0;
+-	  ethernet_vlan_header_t *vlan0 = 0;
+           pppoe_header_t * pppoe0;
+           u16 ppp_proto0 = 0;
+           pppoe_session_t * t0;
+@@ -365,7 +320,6 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 	  pppoe_entry_key_t key0;
+ 	  pppoe_entry_result_t result0;
+ 	  u32 bucket0;
+-	  u32 type0;
+ 
+ 	  bi0 = from[0];
+ 	  to_next[0] = bi0;
+@@ -378,34 +332,16 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 	  error0 = 0;
+ 
+           /* get client mac */
+-          vlib_buffer_reset(b0);
+-          h0 = vlib_buffer_get_current (b0);
+-
+-		  /* get pppoe header */
+-		  type0 = clib_net_to_host_u16(h0->type);
+-		  if(type0 == ETHERNET_TYPE_VLAN){
+-			  vlan0 = (ethernet_vlan_header_t *)(h0+1);
+-			  type0 = clib_net_to_host_u16(vlan0->type);
+-			  pppoe0 = (pppoe_header_t*)(vlan0+1);
+-			  if( type0 != ETHERNET_TYPE_PPPOE_DISCOVERY && type0 != ETHERNET_TYPE_PPPOE_SESSION ) {
+-				error0 = PPPOE_ERROR_BAD_VER_TYPE;
+-				result0.fields.session_index =
+-				  ~0; // avoid tracing random data
+-				next0 = PPPOE_INPUT_NEXT_DROP;
+-				goto trace00;
+-			  }
+-		  } else {
+-			  pppoe0 = (pppoe_header_t*)(h0+1);
+-		  }
++          /* ethernet-input left current_data at the PPPoE header, behind any
++             VLAN tags of the (sub-)interface, so QinQ and dot1ad work too */
++          pppoe0 = vlib_buffer_get_current (b0);
++          h0 = (ethernet_header_t *) (b0->data +
++                                         vnet_buffer (b0)->l2_hdr_offset);
+ 
+           ppp_proto0 = clib_net_to_host_u16(pppoe0->ppp_proto);   
+ 
+           if (is_control_plane_packet(pppoe0, pem->is_pass_nd_and_dhcpv6))
+             {
+-		  vlan0 == 0 ?
+-	  	    vlib_buffer_advance(b0, sizeof(*h0))
+-	      :
+-	  	    vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*vlan0));
+ 	      error0 = PPPOE_ERROR_CONTROL_PLANE;
+ 	      next0 = PPPOE_INPUT_NEXT_CP_INPUT;
+ 	      result0.fields.session_index = ~0;
+@@ -426,10 +362,7 @@ VLIB_NODE_FN (pppoe_input_node) (vlib_main_t * vm,
+ 				  result0.fields.session_index);
+ 
+ 	  /* Pop Eth and PPPoE header */
+-	  vlan0 == 0 ?
+-	  	vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*pppoe0))
+-	  :
+-	  	vlib_buffer_advance(b0, sizeof(*h0)+sizeof(*vlan0)+sizeof(*pppoe0));
++	  vlib_buffer_advance (b0, sizeof (*pppoe0));
+ 
+ 	  next0 = (ppp_proto0==PPP_PROTOCOL_ip4)?
+ 		  PPPOE_INPUT_NEXT_IP4_INPUT
+-- 
+2.47.3
+

@@ -1,0 +1,27 @@
+From 8e14cc86375ee2b2653417f3a314a0f641e44f42 Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:24:55 +0700
+Subject: [PATCH 8/9] pppoe: look up the DP hw interface by sw_if_index
+
+dp_if_index is a sw_if_index, so passing it to vnet_get_hw_interface reads
+the wrong interface, or out of bounds, when sw and hw indexes differ.
+---
+ src/plugins/pppoe/pppoe_cp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/plugins/pppoe/pppoe_cp.c b/src/plugins/pppoe/pppoe_cp.c
+index f953b5f2b..fcca79c37 100644
+--- a/src/plugins/pppoe/pppoe_cp.c
++++ b/src/plugins/pppoe/pppoe_cp.c
+@@ -23,7 +23,7 @@ pppoe_add_del_cp (u32 cp_if_index, u32 dp_if_index, u8 is_add)
+ 
+   if (!vnet_sw_interface_is_sub (vnm, dp_if_index))
+     {
+-      dp_hw = vnet_get_hw_interface (vnm, dp_if_index);
++      dp_hw = vnet_get_sup_hw_interface (vnm, dp_if_index);
+ 
+       if (dp_hw->hw_class_index != ethernet_hw_interface_class.index)
+ 	{
+-- 
+2.47.3
+

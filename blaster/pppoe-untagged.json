@@ -1,0 +1,47 @@
+{
+    "interfaces": {
+        "tx-interval": 1,
+        "rx-interval": 1,
+        "network": {
+            "interface": "vbsrv-p",
+            "address": "172.31.99.2/30",
+            "gateway": "172.31.99.1"
+        },
+        "access": [
+            {
+                "interface": "vbsub-p",
+                "type": "pppoe",
+                "vlan-mode": "N:1",
+                "username": "@SUB_USER@{i1}",
+                "password": "@SUB_PASS@",
+                "i1-start": 1001
+            }
+        ]
+    },
+    "sessions": {
+        "count": 1000,
+        "start-rate": 100,
+        "stop-rate": 100,
+        "max-outstanding": 400
+    },
+    "pppoe": {
+        "reconnect": false
+    },
+    "ppp": {
+        "authentication": {
+            "protocol": "PAP"
+        },
+        "ipcp": {
+            "enable": true,
+            "request-dns1": false,
+            "request-dns2": false
+        },
+        "ip6cp": {
+            "enable": false
+        }
+    },
+    "session-traffic": {
+        "autostart": true,
+        "ipv4-pps": 10
+    }
+}

@@ -1,0 +1,91 @@
+From 2982c0f3691dffeb7a8d04b9b75c91cfb54b05bf Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 15:39:36 +0700
+Subject: [PATCH 1/2] hash: spread PPPoE frames over workers by client MAC
+
+handoff-eth only looked at IPv4, IPv6 and MPLS. PPPoE frames, with or
+without VLAN tags, all got the ethertype as key and every subscriber
+ended up on the same worker. Use the client MAC for PPPoE session and
+discovery frames, so subscribers spread over the workers and each one
+stays on one worker.
+---
+ src/vnet/hash/handoff_eth.c | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/src/vnet/hash/handoff_eth.c b/src/vnet/hash/handoff_eth.c
+index 8cb346f3c..a906987ce 100644
+--- a/src/vnet/hash/handoff_eth.c
++++ b/src/vnet/hash/handoff_eth.c
+@@ -119,6 +119,17 @@ bottom_lbl_found:
+ 
+ }
+ 
++static inline u64
++pppoe_get_key (ethernet_header_t *h0)
++{
++  u64 hash_key = 0;
++
++  /* the IP header is behind PPPoE/PPP: keep each subscriber (client MAC)
++     on one worker */
++  clib_memcpy_fast (&hash_key, h0->src_address, 6);
++  return hash_key;
++}
++
+ static inline u64
+ eth_get_sym_key (ethernet_header_t * h0)
+ {
+@@ -143,6 +154,11 @@ eth_get_sym_key (ethernet_header_t * h0)
+     {
+       hash_key = mpls_get_key ((mpls_unicast_header_t *) (h0 + 1));
+     }
++  else if (h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION) ||
++	   h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_DISCOVERY))
++    {
++      hash_key = pppoe_get_key (h0);
++    }
+   else
+     if (PREDICT_FALSE
+ 	((h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_VLAN))
+@@ -172,6 +188,13 @@ eth_get_sym_key (ethernet_header_t * h0)
+ 	{
+ 	  hash_key = mpls_get_key ((mpls_unicast_header_t *) (outer + 1));
+ 	}
++      else if (outer->type ==
++		 clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION) ||
++	       outer->type ==
++		 clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_DISCOVERY))
++	{
++	  hash_key = pppoe_get_key (h0);
++	}
+       else
+ 	{
+ 	  hash_key = outer->type;
+@@ -202,6 +225,11 @@ eth_get_key (ethernet_header_t * h0)
+     {
+       hash_key = mpls_get_key ((mpls_unicast_header_t *) (h0 + 1));
+     }
++  else if (h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION) ||
++	   h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_DISCOVERY))
++    {
++      hash_key = pppoe_get_key (h0);
++    }
+   else if ((h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_VLAN)) ||
+ 	   (h0->type == clib_host_to_net_u16 (ETHERNET_TYPE_DOT1AD)))
+     {
+@@ -222,6 +250,13 @@ eth_get_key (ethernet_header_t * h0)
+ 	{
+ 	  hash_key = mpls_get_key ((mpls_unicast_header_t *) (outer + 1));
+ 	}
++      else if (outer->type ==
++		 clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_SESSION) ||
++	       outer->type ==
++		 clib_host_to_net_u16 (ETHERNET_TYPE_PPPOE_DISCOVERY))
++	{
++	  hash_key = pppoe_get_key (h0);
++	}
+       else
+ 	{
+ 	  hash_key = outer->type;
+-- 
+2.47.3
+

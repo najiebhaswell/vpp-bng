@@ -1,0 +1,7 @@
+lab.env
+captures/
+old/
+vpp/
+accel-ppp-ng/
+*.xwd
+__pycache__/

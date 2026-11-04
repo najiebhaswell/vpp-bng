@@ -1,0 +1,53 @@
+From ce8737c6eda6d8ff3e0a1f4d6a970ee5dacea4b6 Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:15:25 +0700
+Subject: [PATCH 7/9] pppoe: use vlib_rpc_call_main_thread
+
+vl_api_rpc_call_main_thread is gone in 26.10.
+---
+ src/plugins/pppoe/pppoe_cp_node.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/plugins/pppoe/pppoe_cp_node.c b/src/plugins/pppoe/pppoe_cp_node.c
+index 121e9ddef..f1eac1f38 100644
+--- a/src/plugins/pppoe/pppoe_cp_node.c
++++ b/src/plugins/pppoe/pppoe_cp_node.c
+@@ -86,7 +86,7 @@ handle_ipcp_configure_nak (vnet_main_t *vnm, pppoe_header_t *pppoe0,
+       options += option_length;
+     }
+ 
+-  vl_api_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
++  vlib_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
+ 			       sizeof (a));
+ }
+ 
+@@ -142,7 +142,7 @@ handle_lcp_packet (vnet_main_t *vnm, pppoe_header_t *pppoe0,
+   a.client_ip = session->client_ip;
+   clib_memcpy (a.client_mac, mac_address, 6);
+ 
+-  vl_api_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
++  vlib_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
+ 			       sizeof (a));
+ }
+ 
+@@ -184,7 +184,7 @@ handle_padt_packet (vnet_main_t *vnm, pppoe_header_t *pppoe0,
+   a.client_ip = session->client_ip;
+   clib_memcpy (a.client_mac, mac, 6);
+ 
+-  vl_api_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
++  vlib_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
+ 			       sizeof (a));
+ }
+ 
+@@ -291,7 +291,7 @@ handle_icmpv6_ra_packet (vnet_main_t *vnm, ethernet_header_t *h0, u8 *packet,
+       options += option_length;
+     }
+ 
+-  vl_api_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
++  vlib_rpc_call_main_thread (vnet_pppoe_add_del_session_cb, (u8 *) &a,
+ 			       sizeof (a));
+ }
+ 
+-- 
+2.47.3
+
