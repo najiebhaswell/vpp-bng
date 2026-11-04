@@ -6,6 +6,7 @@
 #   PPPOE_VLAN=300                         single-tag PPPoE VLAN (sub-interface id 300)
 #   NET_VLAN=301                           network side, 172.31.98.1/30 (bngblaster is .2)
 #   QINQ="100:dot1q:10-59 200:dot1ad:10-59" S-VLAN:type:C-VLAN range, sub-interface ids S*10000+C
+#   ACCEL_TEMPLATE=accel-ppp-lab-cap.conf  accel config template (default accel-ppp-lab-phys.conf)
 set -eu
 . "$(dirname "$0")/lab-env.sh"
 PV=${PPPOE_VLAN:-300}; NV=${NET_VLAN:-301}; B=BondEthernet0
@@ -38,5 +39,5 @@ vppctl create sub-interfaces $B $NV dot1q $NV exact-match >/dev/null
 vppctl set int ip address $B.$NV 172.31.98.1/30; vppctl set int state $B.$NV up
 vppctl show pppoe control-plane binding | tail -n +3 | wc -l | sed 's/^/pppoe mappings: /'
 mkdir -p /var/log/accel-ppp-lab
-install_conf $LAB/accel-ppp-lab-phys.conf /etc/accel-ppp-lab-phys.conf
+install_conf $LAB/${ACCEL_TEMPLATE:-accel-ppp-lab-phys.conf} /etc/accel-ppp-lab-phys.conf
 systemd-run -q --unit=accel-ppp-lab --property=AllowedCPUs=0,14-17 /usr/local/sbin/accel-pppd -c /etc/accel-ppp-lab-phys.conf -p /run/accel-ppp-lab.pid

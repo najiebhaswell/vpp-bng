@@ -15,7 +15,7 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 
 | Path | What |
 |---|---|
-| `vpp-patches/` | 13 patches on VPP commit `5db7b9abb` (26.10) |
+| `vpp-patches/` | 14 patches on VPP commit `5db7b9abb` (26.10) |
 | `build-vpp.sh` | clone VPP, apply the patches, build the .debs |
 | `install-vpp.sh <version>` | install and hold the built .debs, restart VPP, print router state before/after |
 | `build-accel.sh` | build and install accel-ppp-ng from the fork branch with the VPP 26.10 fixes |
@@ -26,7 +26,8 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 | `lab-phys-up.sh` / `lab-phys-down.sh` | physical lab: PPPoE over VLAN/QinQ sub-interfaces of a VPP bond |
 | `capture-test.sh`, `lab-rate.sh` | static-config tests: login, rate limits, teardown, pcaps |
 | `radius-test-run.sh` + `radius-steps.sh` | RADIUS test: PAP/CHAP/MS-CHAPv2, reject, rate attribute, CoA, DM, accounting, timeouts |
-| `blaster/` | BNG Blaster configs and runners (`blaster-run.sh` tap lab, `phys-run.sh` physical) |
+| `blaster/` | BNG Blaster configs and runners (`blaster-run.sh` tap lab, `phys-run.sh` physical, `cap-run.sh` session scale with the DPDK build) |
+| `accel-ppp-lab-cap.conf` | capacity variant of the physical config: verbose logging off, ~135k address pool |
 | `xwd2png.py` | converts xterm window dumps (`phys-run.sh` with `SHOTDIR`) to PNG |
 
 ## VPP patches
@@ -46,12 +47,15 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 | 0011 | pppoe: parse session packets behind any VLAN tags (QinQ sessions stuck after PADS) | new |
 | 0012 | hash: spread PPPoE frames over workers by client MAC | new |
 | 0013 | handoff: do not crash when the RX interface has no handoff config (SIGSEGV with handoff on bond members) | new |
+| 0014 | adj: a midchain on an interface-tx DPO counts the packet once (every downstream PPPoE packet was counted twice on the session, so RADIUS Acct-Output-Octets were doubled) | new |
 
 The accel-ppp-ng fixes live in the fork
 [najiebhaswell/accel-ppp-ng, branch `vpp-2610-fixes`](https://github.com/najiebhaswell/accel-ppp-ng/tree/vpp-2610-fixes):
 policer-input enabled twice, burst in bytes, PPPoE interface options dropped after `net=`/`vpp-cp=`, session
 counters from the VPP stats segment (without it every VPP session died with Lost-Carrier at the first RADIUS
-interim, and octets were 0), and the shaper `G` suffix (it was ×10).
+interim, and octets were 0), the shaper `G` suffix (it was ×10), and reading those counters in place: the first
+version re-mapped the stats segment for every new session, which capped setup at ~65 sessions/s and made accel
+exit at 5120 sessions.
 
 ## Build and install
 
@@ -116,7 +120,7 @@ router's `dae-server`), and `logs/radacct/` with FreeRADIUS detail files.
 
 ## Results
 
-All with accel-ppp-ng from the fork, VPP with all 13 patches, RADIUS (FreeRADIUS 3.2) for every login,
+All with accel-ppp-ng from the fork, VPP with the patches, RADIUS (FreeRADIUS 3.2) for every login,
 10 pps per session in each direction.
 
 | Test | Result |
@@ -128,6 +132,25 @@ All with accel-ppp-ng from the fork, VPP with all 13 patches, RADIUS (FreeRADIUS
 | Physical, 1000 sessions VLAN 300 | 11.3 s, 2000/2000 flows, 0 loss, PPPoE upstream on all 12 workers |
 | Physical, 100 sessions QinQ (dot1q + dot1ad S-VLAN) | 2.6 s, 200/200 flows, 0 loss, tag order 0x88a8/0x8100 on the wire |
 | Physical, 4000 sessions VLAN 300 | 27–30 s, 8000 policers, 8000/8000 flows; ~0.1% loss from NIC rx_missed while the runner polled 4000 sessions over the CLI (0 without that loop) |
+
+### Session scale
+
+BNG Blaster (upstream build with DPDK, LAG/LACP over both ports) on a separate host, PPPoE N:1 on VLAN 300, CHAP
+via RADIUS, 1 pps of session traffic per session each way, `cap-run.sh`:
+
+| Sessions @ start rate | Up after | Setup rate (Blaster avg) | Flows verified | accel CPU / RSS | VPP heap |
+|---|---|---|---|---|---|
+| 10k @ 200/s | 59.6 s | 192/s | 20000/20000 | 7% / 83 MB | 669 MB |
+| 10k @ 500/s | 27.5 s | 473/s | 20000/20000 | 7% | |
+| 10k @ 1000/s | 22.1 s | 912/s | 20000/20000 | 9% | |
+| 64k @ 200/s | 411 s (63992 up, 8 failed, no retry) | 192/s | 127986/128000 | 48% / 720 MB | 1.0 GB of 4 GB, 128k policers |
+| 64k @ 1000/s | peaked at 59.7k, then ~6.7k sessions dropped | | | | |
+
+Every session costs VPP several API calls (interface, features, two policers, a route), each under the worker
+barrier, and creating an interface gets slower as their number grows. Past ~35k sessions a fast setup or teardown
+stalls the workers long enough to overflow the NIC RX rings (`rx_missed_errors`); at 1000/s that loses LCP
+echoes and sessions drop. With sessions up and steady there are no misses. For tens of thousands of subscribers
+keep the setup rate around 200-400/s.
 
 Use `down-burst-factor=0.5` (or more) in `[shaper]` with VPP policers: they drop without a queue, and with the
 default 0.1 TCP gets about half of the configured rate.

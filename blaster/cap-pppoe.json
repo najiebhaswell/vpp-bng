@@ -1,0 +1,76 @@
+{
+    "interfaces": {
+        "io-mode": "dpdk",
+        "network": {
+            "interface": "lag0",
+            "vlan": 301,
+            "address": "172.31.98.2/30",
+            "gateway": "172.31.98.1"
+        },
+        "access": [
+            {
+                "interface": "lag0",
+                "type": "pppoe",
+                "vlan-mode": "N:1",
+                "username": "@SUB_USER@{session-global}",
+                "password": "@SUB_PASS@",
+                "outer-vlan": 300,
+                "stream-group-id": 1
+            }
+        ],
+        "lag": [
+            {
+                "interface": "lag0",
+                "lacp": true,
+                "lacp-timeout-short": true
+            }
+        ],
+        "links": [
+            {
+                "interface": "0000:3b:00.0",
+                "lag-interface": "lag0",
+                "rx-threads": 4
+            },
+            {
+                "interface": "0000:3b:00.1",
+                "lag-interface": "lag0",
+                "rx-threads": 4
+            }
+        ]
+    },
+    "sessions": {
+        "count": 10000,
+        "start-rate": 200,
+        "stop-rate": 200,
+        "max-outstanding": 800
+    },
+    "pppoe": {
+        "reconnect": false,
+        "discovery-timeout": 2,
+        "discovery-retry": 10
+    },
+    "ppp": {
+        "mru": 1492,
+        "authentication": {
+            "protocol": "CHAP"
+        },
+        "lcp": {
+            "conf-request-timeout": 5,
+            "conf-request-retry": 10,
+            "keepalive-interval": 30,
+            "keepalive-retry": 3
+        },
+        "ipcp": {
+            "enable": true,
+            "request-dns1": false,
+            "request-dns2": false
+        },
+        "ip6cp": {
+            "enable": false
+        }
+    },
+    "session-traffic": {
+        "autostart": true,
+        "ipv4-pps": 1
+    }
+}

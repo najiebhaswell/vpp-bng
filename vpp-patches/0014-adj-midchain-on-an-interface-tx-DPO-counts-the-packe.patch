@@ -1,0 +1,70 @@
+From 9b5eb2a87930406dd1be0672723804cd88a66bdc Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 11:23:30 +0700
+Subject: [PATCH] adj: midchain on an interface-tx DPO counts the packet once
+
+pppoe stacks its session midchain on the access interface's tx DPO, so
+after tunnel-output (or adj-midchain-tx) the packet goes straight to the
+access interface's output node. That node counts the packet on
+sw_if_index[VLIB_TX], which still names the tunnel: every downstream
+PPPoE packet was counted twice on the session interface (accel-ppp sent
+RADIUS Acct-Output-Octets doubled) and never on the access interface.
+
+When the next DPO is an interface-tx DPO, point sw_if_index[VLIB_TX] at
+that interface. This happens after the output features, which still see
+the tunnel interface (policer-output looks its policer up by it).
+
+Type: fix
+---
+ src/vnet/adj/adj_midchain_node.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/vnet/adj/adj_midchain_node.c b/src/vnet/adj/adj_midchain_node.c
+index db4b586ad..0968fc4bd 100644
+--- a/src/vnet/adj/adj_midchain_node.c
++++ b/src/vnet/adj/adj_midchain_node.c
+@@ -6,6 +6,19 @@
+ #include <vnet/adj/adj_internal.h>
+ #include <vnet/adj/adj_midchain.h>
+ 
++/*
++ * A midchain stacked on an interface-tx DPO goes straight to that
++ * interface's output node, which counts the packet on sw_if_index[VLIB_TX].
++ * That still names the tunnel, already counted here: point it at the
++ * interface the packet leaves on.
++ */
++static_always_inline void
++adj_midchain_tx_set_sw_if_index (vlib_buffer_t *b, const dpo_id_t *dpo)
++{
++    if (DPO_INTERFACE_TX == dpo->dpoi_type)
++        vnet_buffer(b)->sw_if_index[VLIB_TX] = dpo->dpoi_index;
++}
++
+ /**
+  * @brief Trace data for packets traversing the midchain tx node
+  */
+@@ -74,9 +87,13 @@ adj_midchain_tx_inline (vlib_main_t * vm,
+         next[3] = dpo3->dpoi_next_node;
+ 
+         vnet_buffer(b[0])->ip.adj_index[VLIB_TX] = dpo0->dpoi_index;
++        adj_midchain_tx_set_sw_if_index (b[0], dpo0);
+         vnet_buffer(b[1])->ip.adj_index[VLIB_TX] = dpo1->dpoi_index;
++        adj_midchain_tx_set_sw_if_index (b[1], dpo1);
+         vnet_buffer(b[2])->ip.adj_index[VLIB_TX] = dpo2->dpoi_index;
++        adj_midchain_tx_set_sw_if_index (b[2], dpo2);
+         vnet_buffer(b[3])->ip.adj_index[VLIB_TX] = dpo3->dpoi_index;
++        adj_midchain_tx_set_sw_if_index (b[3], dpo3);
+ 
+         if (interface_count)
+         {
+@@ -150,6 +167,7 @@ adj_midchain_tx_inline (vlib_main_t * vm,
+         dpo0 = &adj0->sub_type.midchain.next_dpo;
+         next[0] = dpo0->dpoi_next_node;
+         vnet_buffer(b[0])->ip.adj_index[VLIB_TX] = dpo0->dpoi_index;
++        adj_midchain_tx_set_sw_if_index (b[0], dpo0);
+ 
+         if (interface_count)
+         {
+-- 
+2.47.3
+
