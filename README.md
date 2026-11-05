@@ -19,6 +19,8 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 | `build-vpp.sh` | clone VPP, apply the patches, build the .debs |
 | `install-vpp.sh <version>` | install and hold the built .debs, restart VPP, print router state before/after |
 | `build-accel.sh` | build and install accel-ppp-ng from the fork branch with the VPP 26.10 fixes |
+| `build-pppoe-hash.sh` + `kernel-patches/` | kernel `pppoe` module with 8192 session hash buckets instead of 16 (needed above a few thousand sessions) |
+| `snmp-patches/` | govpp-snmp-agentx: leave subscriber sessions out of IF-MIB, handle interface events in bursts |
 | `lab-env.sh`, `lab.env.example` | site settings (hosts, RADIUS, subscriber names) used by every script |
 | `accel-ppp-lab*.conf` | accel-ppp configs: static (`chap-secrets`), RADIUS, physical; `@VAR@` filled in from `lab.env` |
 | `lab-up.sh` / `lab-down.sh` | tap lab: pppd client netns → VPP → iperf3 server netns |
@@ -26,7 +28,7 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 | `lab-phys-up.sh` / `lab-phys-down.sh` | physical lab: PPPoE over VLAN/QinQ sub-interfaces of a VPP bond |
 | `capture-test.sh`, `lab-rate.sh` | static-config tests: login, rate limits, teardown, pcaps |
 | `radius-test-run.sh` + `radius-steps.sh` | RADIUS test: PAP/CHAP/MS-CHAPv2, reject, rate attribute, CoA, DM, accounting, timeouts |
-| `blaster/` | BNG Blaster configs and runners (`blaster-run.sh` tap lab, `phys-run.sh` physical, `cap-run.sh` session scale with the DPDK build) |
+| `blaster/` | BNG Blaster configs and runners (`blaster-run.sh` tap lab, `phys-run.sh` physical, `cap-run.sh` session scale with the DPDK build, `tput-run.sh` / `trex-run.sh` throughput, `churn-run.sh`, `storm-run.sh` login storm); `barriers.py` (worker barriers from the VPP event log), `cpstat.py` (control-plane tap rates and CPU), `rxmiss.py` (rx-miss of the physical ports), all from the stats segment |
 | `accel-ppp-lab-cap.conf` | capacity variant of the physical config: verbose logging off, ~135k address pool |
 | `xwd2png.py` | converts xterm window dumps (`phys-run.sh` with `SHOTDIR`) to PNG |
 
@@ -248,9 +250,34 @@ RADIUS Disconnect would) and BNG Blaster logs them in again through RADIUS (`bla
 Use `down-burst-factor=0.5` (or more) in `[shaper]` with VPP policers: they drop without a queue, and with the
 default 0.1 TCP gets about half of the configured rate.
 
+### Login storms
+
+As after the failure of the other BNG of a pair: 64k sessions with 1 pps each way, 20 S-VLANs × 10 C-VLANs (N:1,
+~320 sessions per pair), then every second session goes at once and logs in again (`blaster/storm-run.sh`; the router
+terminates them, BNG Blaster reconnects). What it took to get there:
+
+| Problem | Seen as | Fix |
+|---|---|---|
+| CP tap rings of 256 | `tap950-tx no free tx slots`, PADI/LCP lost, 10k logins in 128 s with ~4000 retries | `rx-ring-size 4096 tx-ring-size 4096` on the CP tap: 10k in 36 s, no retries |
+| Kernel `pppoe` hash of 16 buckets (`CONFIG_PPPOE_HASH_BITS=4`) | every control frame walks thousands of sessions: vhost 68% CPU for 11k pps, tap overflows, healthy sessions lose their LCP echoes | `build-pppoe-hash.sh`: 8192 buckets, jhash; vhost 2%, 64k sessions up in 154–181 s (RADIUS-bound) instead of 351–416 s with stuck sessions |
+| accel-ppp returns session ids with an `int` shift into a 64-bit map (also in upstream accel-ppp) | after churn `pppoe: no free sid available`, PADR unanswered, ids still in use handed out again | fork commit `pppoe: return session ids to the map with an unsigned long shift` |
+| govpp-snmp-agentx dumps every interface on every interface event | one core busy all the time, 800 MB, VPP main thread busy with dumps | `snmp-patches/`: `-vppstats.exclude ^pppoe_session`, events in bursts; 1–3% CPU, IF-MIB without sessions |
+
+Creating a session costs the workers 9 barriers of ~5 µs each and no node refork; at ~1400 logins/s they are held
+for ≤3.3% of the time. `vppctl show`/`clear` commands are worse: `show memory` holds every worker for 15 ms,
+`clear hardware` 5 ms, `show hardware` 1.6 ms, `show runtime`/`show errors` ~0.5 ms, so monitoring has to read the
+stats segment.
+
+With 8k sessions and 4k of them logging in again at once, all are back after ~16 s and none of the others drops.
+With 64k and 32k at once, BNG Blaster's control loop stalls: a packet capture of an untouched session shows the
+router sending its LCP echo requests to the client and the client still sending data, but no longer answering or
+sending keepalives, so the tester's sessions time out. Storms of that size need another tester.
+
+PPPoE session ids are 16 bits: one accel-ppp instance holds at most 65534 sessions.
+
 ## Not tested
 
-IPv6 / DHCPv6-PD, more than 4000 sessions, a VPP restart with sessions up, other NICs.
+IPv6 / DHCPv6-PD, a VPP restart with sessions up, login storms above ~4k logins at once (tester limit), CGNAT.
 
 ## Credits
 

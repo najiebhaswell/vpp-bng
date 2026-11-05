@@ -17,7 +17,9 @@ MAC=$(vppctl show hardware-interfaces $ACC | awk '/Ethernet address/{print $3; e
 # a port outside the router config (e.g. a NIC added for the lab) comes up admin down
 vppctl set int state $ACC up; vppctl set int state $NET up
 [ -e /run/netns/rootns ] || ip netns attach rootns 1
-vppctl create tap id 950 host-if-name pb host-mac-addr $MAC host-ns rootns >/dev/null
+# big rings: with the default 256 a login burst overflows them ("tap950-tx no free tx slots") and PPPoE
+# discovery/LCP packets to accel are lost, which the client sees as timeouts and retries
+vppctl create tap id 950 host-if-name pb host-mac-addr $MAC host-ns rootns rx-ring-size 4096 tx-ring-size 4096 >/dev/null
 vppctl set int state tap950 up
 # frames from accel are addressed to the subscriber's MAC, not to tap950
 vppctl set interface promiscuous on tap950

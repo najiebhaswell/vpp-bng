@@ -1,0 +1,403 @@
+From ab3afc7b13884dc5c3877b88b8c226966ca51952 Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:49:44 +0700
+Subject: [PATCH] vpp: leave interfaces out of IF-MIB by name, handle interface
+ events in bursts
+
+A BNG has one VPP interface per subscriber session, tens of thousands of them, coming and going all day. Every
+one of them was an interface event, and every event made the agent dump all interfaces again and rebuild the
+details: with 64k sessions it never caught up (one core busy all the time, 800 MB RSS, govpp dropping events as
+"receiver end not ready") and it kept VPP's main thread busy with dumps while the BNG needed it to set sessions up.
+
+-vppstats.exclude <regexp> keeps matching interfaces out of IF-MIB, e.g. '^pppoe_session'. Events that arrive
+within -vppstats.event-holdoff (default 1s) are handled together, and a burst only triggers a full dump when it
+concerns an interface in IF-MIB: events about excluded interfaces are skipped, new interfaces are looked up one by
+one (up to 256 per burst, a full dump above that). The event channel holds 4096 events, and events are logged at
+debug level, once per burst.
+
+On a BNG with 10k sessions coming up and going down: 1-3% CPU instead of 100%, 422 IF-MIB rows instead of one per
+session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vpp/vpp.go            |   9 ++
+ src/vpp/vpp_iface.go      | 191 ++++++++++++++++++++++++++++++++++----
+ src/vpp/vpp_iface_test.go |  76 ++++++++++++++-
+ 3 files changed, 257 insertions(+), 19 deletions(-)
+
+diff --git a/src/vpp/vpp.go b/src/vpp/vpp.go
+index 726ee45..a23288d 100644
+--- a/src/vpp/vpp.go
++++ b/src/vpp/vpp.go
+@@ -4,6 +4,7 @@ package vpp
+ 
+ import (
+ 	"flag"
++	"time"
+ 
+ 	"go.fd.io/govpp/adapter/socketclient"
+ 	"go.fd.io/govpp/adapter/statsclient"
+@@ -25,6 +26,14 @@ var (
+ 	// tunnel family. It is a guess about the fabric, not a fact about
+ 	// the interface, so it is the operator's to set.
+ 	DefaultSpeed = flag.Uint("vppstats.default-speed", 10000, "Speed in Mbps to report for interfaces where VPP knows no link speed (loopbacks, BVIs, taps, tunnels)")
++	// Exclude keeps interfaces out of IF-MIB by VPP name. A BNG has one
++	// interface per subscriber session (pppoe_sessionN), tens of
++	// thousands of them, coming and going all day: they do not belong
++	// in IF-MIB, and every one of them is an interface event.
++	Exclude = flag.String("vppstats.exclude", "", "Regular expression: interfaces whose VPP name matches are left out of IF-MIB, e.g. '^pppoe_session' on a BNG")
++	// EventHoldoff collects the interface events of a burst into one
++	// refresh instead of one full interface dump per event.
++	EventHoldoff = flag.Duration("vppstats.event-holdoff", time.Second, "Interface events arriving within this time are handled together")
+ )
+ 
+ // VPPClient manages VPP connections and provides a unified interface
+diff --git a/src/vpp/vpp_iface.go b/src/vpp/vpp_iface.go
+index dac8cef..202afb0 100644
+--- a/src/vpp/vpp_iface.go
++++ b/src/vpp/vpp_iface.go
+@@ -4,6 +4,8 @@ package vpp
+ 
+ import (
+ 	"os"
++	"regexp"
++	"sync"
+ 	"time"
+ 
+ 	"go.fd.io/govpp/api"
+@@ -33,6 +35,37 @@ type InterfaceManager struct {
+ 	eventCallback  InterfaceEventCallback
+ 	running        bool
+ 	watchingEvents bool
++
++	// known holds every interface of the last full dump, true for the
++	// ones -vppstats.exclude keeps out of IF-MIB, so that their events
++	// need no refresh. nil until the first dump.
++	mu    sync.Mutex
++	known map[interface_types.InterfaceIndex]bool
++}
++
++// maxLookups is the number of new interfaces in one burst of events
++// that are looked up one by one; above it one full dump is cheaper.
++const maxLookups = 256
++
++var (
++	excludeOnce sync.Once
++	excludeRe   *regexp.Regexp
++)
++
++// excluded tells whether -vppstats.exclude keeps an interface out of IF-MIB.
++func excluded(name string) bool {
++	excludeOnce.Do(func() {
++		if *Exclude == "" {
++			return
++		}
++		re, err := regexp.Compile(*Exclude)
++		if err != nil {
++			logger.Printf("Ignoring -vppstats.exclude: %v", err)
++			return
++		}
++		excludeRe = re
++	})
++	return excludeRe != nil && excludeRe.MatchString(name)
+ }
+ 
+ // NewInterfaceManager creates a new interface manager
+@@ -147,7 +180,32 @@ func (im *InterfaceManager) GetAllInterfaceDetails() ([]InterfaceDetails, error)
+ 	}
+ 	defer ch.Close()
+ 
+-	return getAllInterfaceDetails(ch)
++	all, err := getAllInterfaceDetails(ch)
++	if err != nil {
++		return nil, err
++	}
++	return im.remember(all), nil
++}
++
++// remember records a full dump in known and returns the interfaces that
++// belong in IF-MIB.
++func (im *InterfaceManager) remember(all []InterfaceDetails) []InterfaceDetails {
++	im.mu.Lock()
++	defer im.mu.Unlock()
++
++	im.known = make(map[interface_types.InterfaceIndex]bool, len(all))
++	details := make([]InterfaceDetails, 0, len(all))
++	for _, d := range all {
++		ex := excluded(d.InterfaceName)
++		im.known[d.SwIfIndex] = ex
++		if !ex {
++			details = append(details, d)
++		}
++	}
++	if n := len(all) - len(details); n > 0 {
++		logger.Debugf("Left %d of %d interfaces out of IF-MIB (-vppstats.exclude)", n, len(all))
++	}
++	return details
+ }
+ 
+ // StartEventWatcher starts watching for interface events
+@@ -161,20 +219,102 @@ func (im *InterfaceManager) StartEventWatcher() error {
+ 		return err
+ 	}
+ 
+-	return watchInterfaceEvents(ch, im.handleInterfaceEvent)
++	return watchInterfaceEvents(ch, im.handleInterfaceEvents)
+ }
+ 
+-// handleInterfaceEvent handles interface events and calls the callback
+-func (im *InterfaceManager) handleInterfaceEvent() {
+-	if im.eventCallback != nil {
+-		details, err := im.GetAllInterfaceDetails()
+-		if err != nil {
+-			logger.Debugf("Failed to retrieve interface details after event: %v", err)
+-		} else {
+-			logger.Debugf("Calling interface event callback with %d interfaces", len(details))
+-			im.eventCallback(details)
++// handleInterfaceEvents refreshes the interface details after a burst of
++// events, unless all of them concern interfaces that are not in IF-MIB:
++// a full dump on a BNG lists every subscriber session.
++func (im *InterfaceManager) handleInterfaceEvents(events []*interfaces.SwInterfaceEvent) {
++	if im.eventCallback == nil {
++		return
++	}
++	refresh, unknown := im.classify(events)
++	if !refresh && len(unknown) > 0 {
++		refresh = im.lookup(unknown)
++	}
++	logger.Debugf("%d interface event(s), %d new interface(s), refresh %t", len(events), len(unknown), refresh)
++	if !refresh {
++		return
++	}
++	details, err := im.GetAllInterfaceDetails()
++	if err != nil {
++		logger.Debugf("Failed to retrieve interface details after event: %v", err)
++		return
++	}
++	logger.Debugf("Calling interface event callback with %d interfaces", len(details))
++	im.eventCallback(details)
++}
++
++// classify sorts a burst of events: refresh when one concerns an
++// interface in IF-MIB (or nothing was dumped yet); unknown lists the new
++// interfaces whose name decides. A deleted interface that was not in
++// IF-MIB needs nothing.
++func (im *InterfaceManager) classify(events []*interfaces.SwInterfaceEvent) (refresh bool, unknown []interface_types.InterfaceIndex) {
++	im.mu.Lock()
++	defer im.mu.Unlock()
++
++	if im.known == nil {
++		return true, nil
++	}
++	seen := make(map[interface_types.InterfaceIndex]bool)
++	for _, e := range events {
++		ex, known := im.known[e.SwIfIndex]
++		switch {
++		case known && !ex:
++			refresh = true
++		case known:
++			if e.Deleted {
++				delete(im.known, e.SwIfIndex)
++			}
++		case !e.Deleted && !seen[e.SwIfIndex]:
++			seen[e.SwIfIndex] = true
++			unknown = append(unknown, e.SwIfIndex)
++		}
++	}
++	return refresh, unknown
++}
++
++// lookup dumps new interfaces one by one and tells whether one of them
++// belongs in IF-MIB; the excluded ones are recorded in known.
++func (im *InterfaceManager) lookup(idxs []interface_types.InterfaceIndex) bool {
++	if len(idxs) > maxLookups || !im.client.IsConnected() {
++		return true
++	}
++	ch, err := im.client.NewAPIChannel()
++	if err != nil {
++		return true
++	}
++	defer ch.Close()
++
++	for _, idx := range idxs {
++		req := ch.SendMultiRequest(&interfaces.SwInterfaceDump{SwIfIndex: idx})
++		name, found := "", false
++		for {
++			d := &interfaces.SwInterfaceDetails{}
++			stop, err := req.ReceiveReply(d)
++			if err != nil {
++				return true
++			}
++			if stop {
++				break
++			}
++			name, found = d.InterfaceName, true
++		}
++		if !found {
++			// deleted again before we got to it
++			continue
++		}
++		if !excluded(name) {
++			return true
+ 		}
++		im.mu.Lock()
++		if im.known != nil {
++			im.known[idx] = true
++		}
++		im.mu.Unlock()
+ 	}
++	return false
+ }
+ 
+ // getAllInterfaceDetails retrieves detailed information for all interfaces (internal function)
+@@ -225,10 +365,11 @@ func getAllInterfaceDetails(ch api.Channel) ([]InterfaceDetails, error) {
+ }
+ 
+ // watchInterfaceEvents watches for VPP interface events (internal function)
+-func watchInterfaceEvents(ch api.Channel, callback func()) error {
++func watchInterfaceEvents(ch api.Channel, callback func([]*interfaces.SwInterfaceEvent)) error {
+ 	logger.Debugf("WatchInterfaceEvents() called - starting interface event monitoring")
+ 
+-	notifChan := make(chan api.Message, 100)
++	// room for a burst: govpp drops notifications when this is full
++	notifChan := make(chan api.Message, 4096)
+ 
+ 	// subscribe for specific event message
+ 	logger.Debugf("Subscribing to interface events...")
+@@ -275,13 +416,27 @@ func watchInterfaceEvents(ch api.Channel, callback func()) error {
+ 
+ 		logger.Debugf("Interface event listener waiting for events...")
+ 		for notif := range notifChan {
+-			e := notif.(*interfaces.SwInterfaceEvent)
+-			logger.Printf("interface event: SwIfIndex=%d, Flags=%d, Deleted=%t",
+-				e.SwIfIndex, e.Flags, e.Deleted)
++			// collect the rest of the burst, then handle it at once
++			batch := []*interfaces.SwInterfaceEvent{notif.(*interfaces.SwInterfaceEvent)}
++			holdoff := time.After(*EventHoldoff)
++		collect:
++			for {
++				select {
++				case n, ok := <-notifChan:
++					if !ok {
++						break collect
++					}
++					batch = append(batch, n.(*interfaces.SwInterfaceEvent))
++				case <-holdoff:
++					break collect
++				}
++			}
++			e := batch[0]
++			logger.Debugf("interface events: %d, first SwIfIndex=%d, Flags=%d, Deleted=%t",
++				len(batch), e.SwIfIndex, e.Flags, e.Deleted)
+ 
+-			// When an interface event occurs, call the callback
+ 			if callback != nil {
+-				callback()
++				callback(batch)
+ 			}
+ 		}
+ 		logger.Debugf("Interface event listener goroutine ended")
+diff --git a/src/vpp/vpp_iface_test.go b/src/vpp/vpp_iface_test.go
+index 18a0e09..97912d7 100644
+--- a/src/vpp/vpp_iface_test.go
++++ b/src/vpp/vpp_iface_test.go
+@@ -3,9 +3,11 @@
+ package vpp
+ 
+ import (
++	"sync"
+ 	"testing"
+ 	"time"
+ 
++	interfaces "go.fd.io/govpp/binapi/interface"
+ 	"go.fd.io/govpp/binapi/interface_types"
+ )
+ 
+@@ -124,7 +126,7 @@ func TestInterfaceManagerHandleInterfaceEventWithoutCallback(t *testing.T) {
+ 	manager := NewInterfaceManager(client)
+ 
+ 	// Should not panic when callback is nil
+-	manager.handleInterfaceEvent()
++	manager.handleInterfaceEvents(nil)
+ }
+ 
+ func TestInterfaceManagerInitializeEventWatchingWithoutConnection(t *testing.T) {
+@@ -283,3 +285,75 @@ func TestInterfaceManagerEventMonitoringWithConnectionChanges(t *testing.T) {
+ 		t.Error("Should not be watching events initially when VPP is not connected")
+ 	}
+ }
++
++// setExclude sets -vppstats.exclude for a test and undoes it afterwards.
++func setExclude(t *testing.T, re string) {
++	old := *Exclude
++	*Exclude = re
++	excludeOnce, excludeRe = sync.Once{}, nil
++	t.Cleanup(func() {
++		*Exclude = old
++		excludeOnce, excludeRe = sync.Once{}, nil
++	})
++}
++
++func TestRememberLeavesExcludedOut(t *testing.T) {
++	setExclude(t, "^pppoe_session")
++	manager := NewInterfaceManager(&VPPClient{})
++
++	details := manager.remember([]InterfaceDetails{
++		{SwIfIndex: 1, InterfaceName: "e810-0"},
++		{SwIfIndex: 2, InterfaceName: "pppoe_session0"},
++		{SwIfIndex: 3, InterfaceName: "e810-0.100"},
++	})
++	if len(details) != 2 || details[0].SwIfIndex != 1 || details[1].SwIfIndex != 3 {
++		t.Errorf("remember() = %v, want interfaces 1 and 3", details)
++	}
++	if ex, ok := manager.known[2]; !ok || !ex {
++		t.Errorf("pppoe_session0 should be known as excluded, got %v %v", ex, ok)
++	}
++}
++
++func TestClassifyEvents(t *testing.T) {
++	setExclude(t, "^pppoe_session")
++	manager := NewInterfaceManager(&VPPClient{})
++	ev := func(idx uint32, deleted bool) *interfaces.SwInterfaceEvent {
++		return &interfaces.SwInterfaceEvent{SwIfIndex: interface_types.InterfaceIndex(idx), Deleted: deleted}
++	}
++
++	if refresh, _ := manager.classify([]*interfaces.SwInterfaceEvent{ev(5, false)}); !refresh {
++		t.Error("classify() before the first dump should ask for a refresh")
++	}
++
++	manager.remember([]InterfaceDetails{
++		{SwIfIndex: 1, InterfaceName: "e810-0"},
++		{SwIfIndex: 2, InterfaceName: "pppoe_session0"},
++	})
++	tests := []struct {
++		name    string
++		events  []*interfaces.SwInterfaceEvent
++		refresh bool
++		unknown int
++	}{
++		{"excluded interface goes", []*interfaces.SwInterfaceEvent{ev(2, true)}, false, 0},
++		{"unknown interface was deleted again", []*interfaces.SwInterfaceEvent{ev(9, true)}, false, 0},
++		{"new interfaces, counted once", []*interfaces.SwInterfaceEvent{ev(7, false), ev(7, false), ev(8, false)}, false, 2},
++		{"interface in IF-MIB changes", []*interfaces.SwInterfaceEvent{ev(2, true), ev(1, false)}, true, 0},
++	}
++	for _, tt := range tests {
++		refresh, unknown := manager.classify(tt.events)
++		if refresh != tt.refresh || len(unknown) != tt.unknown {
++			t.Errorf("%s: classify() = %v, %d unknown; want %v, %d", tt.name, refresh, len(unknown), tt.refresh, tt.unknown)
++		}
++	}
++	if _, ok := manager.known[2]; ok {
++		t.Error("a deleted excluded interface should be forgotten")
++	}
++}
++
++func TestExcludedWithoutPattern(t *testing.T) {
++	setExclude(t, "")
++	if excluded("pppoe_session0") {
++		t.Error("nothing should be excluded without -vppstats.exclude")
++	}
++}
+-- 
+2.47.3
+

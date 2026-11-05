@@ -4,6 +4,9 @@
 #   cap-run.sh <config.json> <run-name> <sessions> <start-rate> [hold-seconds]
 # Samples setup progress, accel (state, CPU, RSS, RADIUS query time) and VPP every 5 s; checks that every session
 # passes traffic; tears down at the same rate. Output: captures/<run-name>/ (test.log, report.json, bngblaster.out)
+#   PORTS="e810-0 cx5-1"  ports whose rx_missed counts after the run (default cx5-0 cx5-1)
+#   ELOG=1                record VPP worker barriers during setup: barriers.txt (time, caller, µs the workers were
+#                         held) and a summary per 1000 sessions
 . "$(dirname "$0")/../lab-env.sh"
 CFG=$1; NAME=$2; COUNT=$3; RATE=$4; HOLD=${5:-30}
 BIN=${BB_DPDK_BIN:-/opt/bngblaster-upstream/bin}; SOCK=/tmp/bb-cap.sock; R=/tmp/bb-cap
@@ -14,17 +17,17 @@ br() { echo "\$ $1"; ssh $BR "sudo bash -s" <<< "$1"; echo; }
 bbq() { ssh $BB "bash -s" <<< "$1"; }
 cli() { bbq "sudo $BIN/bngblaster-cli $SOCK $*"; }
 counter() { cli session-counters 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['session-counters'].get('$1', 0))" 2>/dev/null || echo 0; }
-# one line of router state: accel sessions, accel CPU% (since start) and RSS, RADIUS auth time, VPP sessions/heap
+# one line of router state: accel sessions, accel CPU% (since start) and RSS, RADIUS auth time, VPP rx-miss total
+PORTS=${PORTS:-cx5-0 cx5-1}
 brstate() {
-  ssh $BR 'sudo bash -s' <<'EOF'
-s=$(accel-cmd -p 2001 show stat)
+  ssh $BR "sudo BR_DIR=$BR_DIR bash -s" <<'EOF'
+s=$(accel-cmd -p 2001 show stat | tr -d '\r')
 st() { echo "$s" | awk -v k="$1" '$1 == k":" {print $2; exit}'; }
-q=$(echo "$s" | awk '/auth avg query time/ {print $NF; exit}' | cut -d/ -f2)
+q=$(echo "$s" | awk '/auth avg query time/ {print $(NF - 1); exit}' | cut -d/ -f2)
 p=$(ps -o %cpu=,rss= -C accel-pppd | awk '{printf "cpu %s%% rss %dM", $1, $2/1024}')
-v=$(vppctl show pppoe session | head -1 | grep -oE '[0-9]+' || echo 0)
-h=$(vppctl show memory main-heap | awk '/total:/ {print $4; exit}' | tr -d ,)
-m=$(for i in cx5-0 cx5-1; do vppctl show hardware $i; done | awk '/rx_missed_errors/ {s += $2} END {print s + 0}')
-echo "accel starting $(st starting) active $(st active), $p, radius auth $q ms | vpp sessions $v, heap used $h, rx_missed $m"
+# from the stats segment only: vppctl show/clear commands stop the workers (show memory ~15 ms)
+m=$(python3 $BR_DIR/blaster/rxmiss.py)
+echo "accel starting $(st starting) active $(st active), $p, radius auth $q ms | rx-miss $m"
 EOF
 }
 vppstate() {
@@ -47,6 +50,7 @@ br "accel-cmd -p 2001 show stat | grep -E -A3 '^sessions:'; systemctl show accel
 vppstate
 
 sec "1. Session setup"
+[ "${ELOG:-0}" = 1 ] && br "vppctl event-logger resize ${ELOG_EVENTS:-8000000} >/dev/null; vppctl event-logger trace api barrier >/dev/null; echo barrier trace on"
 bbq "sudo rm -f $SOCK $R-report.json; sudo setsid nohup $BIN/bngblaster -C $R.json -S $SOCK -J $R-report.json -j sessions -L $R.log -l info -b -f > $R.out 2>&1 < /dev/null &"
 for i in $(seq 1 100); do bbq "sudo test -S $SOCK" && break; sleep 0.3; done
 T0=$(date +%s.%N); LAST=-1; SINCE=$SECONDS
@@ -61,6 +65,10 @@ while :; do
 done
 T1=$(date +%s.%N)
 echo "all $EST sessions established after $(echo "$T1 - $T0" | bc | cut -c1-6) s ($(echo "$EST / ($T1 - $T0)" | bc) sessions/s overall)"
+if [ "${ELOG:-0}" = 1 ]; then
+  ssh $BR "sudo vppctl event-logger trace api barrier disable >/dev/null; sudo vppctl show event-logger all | grep -E 'bar-trace|bar-rel|api-msg|api-call'" > $OUT/elog.txt
+  python3 $LAB/blaster/barriers.py $OUT/elog.txt $OUT/barriers.txt
+fi
 
 sec "2. All sessions up, ${HOLD} s of session traffic"
 sleep $HOLD
@@ -68,14 +76,14 @@ cli session-counters | grep -E '"(sessions|sessions-established|sessions-flapped
 echo "router: $(brstate)"
 vppstate
 br "accel-cmd -p 2001 show stat | sed -n '/^radius/,\$p' | head -14; ps -o pid,%cpu,rss,nlwp,cmd -C accel-pppd"
-br "vppctl show errors | grep -iE 'no free|full|drop|miss|fail' | grep -vE '^\s+0 ' | head -8; for i in cx5-0 cx5-1; do vppctl show hardware \$i | grep -E 'rx_missed|imissed'; done"
+br "vppctl show errors | grep -iE 'no free|full|drop|miss|fail' | grep -vE '^\s+0 ' | head -8; for i in $PORTS; do vppctl show hardware \$i | grep -E 'rx_missed|imissed'; done"
 
 sec "3. Teardown"
 T2=$(date +%s.%N)
 cli terminate
 for i in $(seq 1 3600); do bbq "pgrep -x bngblaster >/dev/null" || break; sleep 1; done
 echo "bngblaster finished $(echo "$(date +%s.%N) - $T2" | bc | cut -c1-6) s after terminate"
-for i in $(seq 1 120); do [ "$(brstate | grep -oE 'vpp sessions [0-9]+' | grep -oE '[0-9]+$')" = 0 ] && break; sleep 2; done
+for i in $(seq 1 120); do [ "$(brstate | grep -oE 'active [0-9]+' | grep -oE '[0-9]+$')" = 0 ] && break; sleep 2; done
 echo "router: $(brstate)"
 vppstate
 bbq "sudo grep -E -A8 'Verified Traffic Flows' $R.out; sudo grep -E -A6 'Violations' $R.out"

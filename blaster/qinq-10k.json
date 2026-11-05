@@ -1,6 +1,7 @@
 {
     "interfaces": {
         "io-mode": "dpdk",
+        "io-slots": 16384,
         "links": [
             {
                 "interface": "0000:3b:00.0",
@@ -77,5 +78,9 @@
         "ip6cp": {
             "enable": false
         }
+    },
+    "session-traffic": {
+        "autostart": true,
+        "ipv4-pps": 1
     }
 }
