@@ -15,7 +15,7 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 
 | Path | What |
 |---|---|
-| `vpp-patches/` | 14 patches on VPP commit `5db7b9abb` (26.10) |
+| `vpp-patches/` | 16 patches on VPP commit `5db7b9abb` (26.10) |
 | `build-vpp.sh` | clone VPP, apply the patches, build the .debs |
 | `install-vpp.sh <version>` | install and hold the built .debs, restart VPP, print router state before/after |
 | `build-accel.sh` | build and install accel-ppp-ng from the fork branch with the VPP 26.10 fixes |
@@ -50,6 +50,8 @@ Status: lab only. Tested on one router (Xeon Gold 6254, 12 VPP workers, ConnectX
 | 0012 | hash: spread PPPoE frames over workers by client MAC | new |
 | 0013 | handoff: do not crash when the RX interface has no handoff config (SIGSEGV with handoff on bond members) | new |
 | 0014 | adj: a midchain on an interface-tx DPO counts the packet once (every downstream PPPoE packet was counted twice on the session, so RADIUS Acct-Output-Octets were doubled) | new |
+| 0015 | nat44-ed: `nat44 plugin enable ... in2out-rx-thread`, translate in2out on the receiving worker instead of handing off by source address (opt-in; small gain, see CGNAT) | new |
+| 0016 | nat44-ed: `set nat44 user limit [sessions <n>] [rate <n>] [alarm <percent>]`, per-subscriber session limit, new-session rate (token bucket) and alarm; `show nat44 users` | new |
 
 The accel-ppp-ng fixes live in the fork
 [najiebhaswell/accel-ppp-ng, branch `vpp-2610-fixes`](https://github.com/najiebhaswell/accel-ppp-ng/tree/vpp-2610-fixes):
@@ -275,9 +277,41 @@ sending keepalives, so the tester's sessions time out. Storms of that size need 
 
 PPPoE session ids are 16 bits: one accel-ppp instance holds at most 65534 sessions.
 
+### CGNAT (NAT44-ED)
+
+NAT44-ED as an output feature on the network sub-interface, 14 workers, 16G main heap,
+`nat44 plugin enable sessions 1000000`, a pool of 1088 addresses. 64k PPPoE sessions (QinQ, N:1) on the E810 with
+RSS (comms DDP, no handoff on the port), TRex sending upstream with 64 UDP source ports per subscriber (4.1M NAT
+sessions) and `dpdk-testpmd` in 5tswap mode reflecting every packet, so the downstream goes through out2in too
+(`blaster/trex-run.sh` with `N1=1 NAT=1 REFLECT=1 FLOWS=64`). Loss is what does not come back:
+
+| 128 B upstream (+ the same reflected) | 6 Mpps | 7 Mpps | 8 Mpps | 9 Mpps |
+|---|---|---|---|---|
+| NAT44-ED | 0.37% | 0.42% | 3.1% | 15.7% |
+| with 0015 `in2out-rx-thread` and MAC handoff | 0.37% | 0.43% | 2.4% | 14.7% |
+| with 0016 per-user tracking on (`sessions 1000 alarm 5`) | 0.37% | 0.42% | 3.1% | 15.5% |
+
+About 14–15 Mpps through the box in total with NAT; IMIX gives the same packet rate. Running out of ports
+(`out of ports`) slows the whole box down; a full session table (`maximum sessions exceeded`) does not.
+
+Patch 0016 bounds what one subscriber (inside address) holds. Same test, 64 flows per subscriber:
+
+| `set nat44 user limit` | Result |
+|---|---|
+| `sessions 32` | 50.07% loss at 4 and 6 Mpps (half the flows refused, the rest as without limit); exactly 32 × 63995 sessions; every subscriber counted once in `/nat44-ed/user-alarms` |
+| `rate 2` | 52 sessions per subscriber after ~25 s of traffic (2 of burst + 2/s) |
+
+The check runs in the slow path before a port is taken; a refused packet costs ~1400 clocks. Counters for
+monitoring are in the stats segment: `/nat44-ed/users`, `/nat44-ed/users-over-alarm`, `/nat44-ed/user-alarms` and
+the `per-user session limit reached` / `per-user new session rate exceeded` errors.
+
+New sessions of an unknown IP protocol (GRE, ESP, ...) walk every session of the worker in NAT44-ED; with
+millions of sessions that is expensive, and patch 0016's limits are checked before the walk.
+
 ## Not tested
 
-IPv6 / DHCPv6-PD, a VPP restart with sessions up, login storms above ~4k logins at once (tester limit), CGNAT.
+IPv6 / DHCPv6-PD, a VPP restart with sessions up, login storms above ~4k logins at once (tester limit), NAT
+logging, NAT with enterprise static mappings.
 
 ## Credits
 

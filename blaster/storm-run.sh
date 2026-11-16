@@ -43,26 +43,7 @@ EOF
 }
 missed() { brstate | grep -oE 'rx-miss [0-9]+' | grep -oE '[0-9]+$'; }
 
-python3 - "$LAB/blaster/qinq-10k.json" "$COUNT" "$RATE" "${QINQ:?QINQ=...}" > $OUT/config.json <<'EOF'
-import json, sys
-c = json.load(open(sys.argv[1]))
-n, rate = int(sys.argv[2]), int(sys.argv[3])
-base = c["interfaces"]["access"][0]
-access = []
-for q in sys.argv[4].split():
-    sr, t, cr = q.split(":")
-    s1, _, s2 = sr.partition("-"); c1, _, c2 = cr.partition("-")
-    for s in range(int(s1), int(s2 or s1) + 1):
-        for cv in range(int(c1), int(c2 or c1) + 1):
-            a = {k: v for k, v in base.items() if not k.endswith("-vlan-min") and not k.endswith("-vlan-max")}
-            a.update({"vlan-mode": "N:1", "outer-vlan": s, "inner-vlan": cv, "qinq": t == "dot1ad",
-                      "stream-group-id": 1, "session-group-id": len(access) % 2 + 1})
-            access.append(a)
-c["interfaces"]["access"] = access
-c["sessions"].update({"count": n, "start-rate": rate, "stop-rate": rate, "max-outstanding": max(1600, 4 * rate)})
-c["pppoe"]["reconnect"] = True
-print(json.dumps(c, indent=4))
-EOF
+python3 $LAB/blaster/qinq-n1.py $LAB/blaster/qinq-10k.json "$COUNT" "$RATE" "${QINQ:?QINQ=...}" > $OUT/config.json
 subst $OUT/config.json | ssh $BB "cat > $R.json"
 echo "sessions $COUNT over $(python3 -c "import json; print(len(json.load(open('$OUT/config.json'))['interfaces']['access']))" ) S/C VLAN pairs (N:1), start-rate $RATE/s, reconnect on, 1 pps each way per session"
 

@@ -5,7 +5,8 @@ LAB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # subst <file>: print a template with its @VAR@ placeholders filled in from lab.env
 subst() {
   sed -e "s|@RADIUS_SERVER@|$RADIUS_SERVER|g" -e "s|@RADIUS_SECRET@|$RADIUS_SECRET|g" -e "s|@NAS_IP@|$NAS_IP|g" \
-      -e "s|@NAS_ID@|$NAS_ID|g" -e "s|@SUB_USER@|$SUB_USER|g" -e "s|@SUB_PASS@|$SUB_PASS|g" "$1"
+      -e "s|@NAS_ID@|$NAS_ID|g" -e "s|@SUB_USER@|$SUB_USER|g" -e "s|@SUB_PASS@|$SUB_PASS|g" \
+      -e "s|@ACCT_INTERIM@|${ACCT_INTERIM:-30}|g" "$1"
 }
 # install_conf <template> <dest>: subst into dest, readable by root only (it holds the RADIUS secret)
 install_conf() { install -m 600 /dev/null "$2"; subst "$1" > "$2"; }

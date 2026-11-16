@@ -10,6 +10,8 @@
 #   NET_VLAN=301                           network side, 172.31.98.1/30 (bngblaster is .2)
 #   QINQ="100:dot1q:10-59 200-204:dot1ad:1-1000"  S-VLAN[-range]:type:C-VLAN range, sub-interface ids S*10000+C
 #   ACCEL_TEMPLATE=accel-ppp-lab-cap.conf  accel config template (default accel-ppp-lab-phys.conf)
+#   ACCEL_CPUS=0,14-17                     CPUs for accel-pppd (keep it off the VPP workers)
+#   ACCEL_BIN=/usr/local/sbin/accel-pppd   accel-pppd to run (e.g. a build under test in another prefix)
 set -eu
 . "$(dirname "$0")/lab-env.sh"
 PV=${PPPOE_VLAN:-300}; NV=${NET_VLAN:-301}; ACC=${ACCESS_IF:-BondEthernet0}; NET=${NET_IF:-$ACC}
@@ -18,9 +20,14 @@ MAC=$(vppctl show hardware-interfaces $ACC | awk '/Ethernet address/{print $3; e
 vppctl set int state $ACC up; vppctl set int state $NET up
 [ -e /run/netns/rootns ] || ip netns attach rootns 1
 # big rings: with the default 256 a login burst overflows them ("tap950-tx no free tx slots") and PPPoE
-# discovery/LCP packets to accel are lost, which the client sees as timeouts and retries
-vppctl create tap id 950 host-if-name pb host-mac-addr $MAC host-ns rootns rx-ring-size 4096 tx-ring-size 4096 >/dev/null
+# discovery/LCP packets to accel are lost, which the client sees as timeouts and retries. One TX queue per VPP
+# thread (vhost-net works on queue pairs, so as many RX queues): with PPPoE spread over all workers a single
+# shared queue fills up while vhost sleeps
+TXQ=${TAP_TXQ:-$(vppctl show threads | tail -n +2 | grep -c .)}
+vppctl create tap id 950 host-if-name pb host-mac-addr $MAC host-ns rootns rx-ring-size 4096 tx-ring-size 4096 num-rx-queues $TXQ num-tx-queues $TXQ >/dev/null
 vppctl set int state tap950 up
+# VHOST_CPUS=<list>: the tap's vhost kernel threads on those CPUs, off the VPP workers
+[ -n "${VHOST_CPUS:-}" ] && for t in $(pgrep "^vhost-$(pgrep -x vpp_main)"); do taskset -p -c $VHOST_CPUS $t >/dev/null; done
 # frames from accel are addressed to the subscriber's MAC, not to tap950
 vppctl set interface promiscuous on tap950
 ip link set pb up
@@ -59,4 +66,4 @@ ip -batch $K
 vppctl show pppoe control-plane binding | tail -n +3 | wc -l | sed 's/^/pppoe mappings: /'
 mkdir -p /var/log/accel-ppp-lab
 install_conf $LAB/${ACCEL_TEMPLATE:-accel-ppp-lab-phys.conf} /etc/accel-ppp-lab-phys.conf
-systemd-run -q --unit=accel-ppp-lab --property=AllowedCPUs=0,14-17 /usr/local/sbin/accel-pppd -c /etc/accel-ppp-lab-phys.conf -p /run/accel-ppp-lab.pid
+systemd-run -q --unit=accel-ppp-lab --property=AllowedCPUs=${ACCEL_CPUS:-0,14-17} ${ACCEL_BIN:-/usr/local/sbin/accel-pppd} -c /etc/accel-ppp-lab-phys.conf -p /run/accel-ppp-lab.pid

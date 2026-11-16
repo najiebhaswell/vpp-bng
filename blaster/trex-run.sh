@@ -9,14 +9,20 @@
 #   ACCESS_IF=cx5-0 NET_IF=cx5-1 PPPOE_VLAN=none QINQ="100-104:dot1q:1-1000 200-204:dot1ad:1-1000" \
 #     CFG_BASE=blaster/qinq-10k.json trex-run.sh tput-trex-qinq 10000 "1400 bi 4.46mpps"
 # HANDOFF=0 takes worker-handoff off the access port, for NICs that spread PPPoE over their RX queues themselves
-# (E810 with the comms DDP package).
+# (E810 with the comms DDP package); NET_HANDOFF=0 off a separate network port, which only sees plain IP.
 # BNG Blaster sets the sessions up (CFG_BASE, default blaster/cap-pppoe.json as a static LAG) and is then killed
 # (no PADT); with LCP echo off the sessions stay. Output: captures/<run-name>/test.log with one JSON result per test
 # and the router's view of it. SHOTDIR=<dir>, run inside xterm: window dumps <dir>/NN.xwd as in tput-run.sh.
+# N1=1: sessions N:1 over the QINQ pairs (blaster/qinq-n1.py) at START_RATE/s (default 1000) instead of CFG_BASE.
+# NAT=1: the router's NAT44-ED (plugin and pool set up already) gets output-feature on the network sub-interface.
+# REFLECT=1: TRex only sends upstream from port 0; dpdk-testpmd in 5tswap mode on the tester's network port sends
+# every packet back (addresses and ports swapped), so the downstream goes through the router's out2in path;
+# FLOWS=<n> source ports per session, DSTNET=<prefix> random destinations (routed to the reflector). Loss is
+# then what does not come back to port 0.
 . "$(dirname "$0")/../lab-env.sh"
 NAME=$1; COUNT=$2; shift 2
 ACC=${ACCESS_IF:-BondEthernet0}; NET=${NET_IF:-$ACC}; PV=${PPPOE_VLAN:-300}; NV=${NET_VLAN:-301}
-LABENV="ACCESS_IF=$ACC NET_IF=$NET PPPOE_VLAN=$PV NET_VLAN=$NV QINQ='${QINQ:-}'"
+LABENV="ACCESS_IF=$ACC NET_IF=$NET PPPOE_VLAN=$PV NET_VLAN=$NV QINQ='${QINQ:-}' ACCEL_CPUS=${ACCEL_CPUS:-0,14-17} VHOST_CPUS=${VHOST_CPUS:-}"
 BIN=${BB_DPDK_BIN:-/opt/bngblaster-upstream/bin}; SOCK=/tmp/bb-trex.sock; R=/tmp/bb-trex
 TREX=/opt/trex/v3.08; TREX_MAC=${TREX_MAC:-b8:ce:f6:1d:63:32}; WINDOW=${WINDOW:-10}
 [ $NET != BondEthernet0 ] && TREX_MAC=${TREX_NET_MAC:-b8:ce:f6:1d:63:33}
@@ -43,15 +49,23 @@ if [ $ACC = BondEthernet0 ]; then
   [ "$MODE" = xor ] || { echo "the bond must be in xor (static) mode: TRex does not speak LACP"; exit 1; }
 fi
 brq "$LABENV ACCEL_TEMPLATE=accel-ppp-lab-tput.conf bash $BR_DIR/lab-phys-up.sh | tail -1
+[ ${NAT:-0} = 1 ] && vppctl set interface nat44 out $NET.$NV output-feature && vppctl show nat44 interfaces | tail -1
+[ -n \"${DSTNET:-}\" ] && vppctl ip route add ${DSTNET:-} via 172.31.98.2 $NET.$NV
+[ ${NET_HANDOFF:-1} = 0 ] && [ $NET != $ACC ] && vppctl show int features $NET | grep -q worker-handoff && vppctl set interface handoff $NET workers 0-\$((\$(vppctl show threads | grep -c vpp_wk) - 1)) disable
 if [ ${HANDOFF:-1} = 1 ]; then
-  vppctl show int features $ACC | grep -q worker-handoff || vppctl set interface handoff $ACC workers 0-11
+  vppctl show int features $ACC | grep -q worker-handoff || vppctl set interface handoff $ACC workers 0-\$((\$(vppctl show threads | grep -c vpp_wk) - 1))
 else
-  vppctl show int features $ACC | grep -q worker-handoff && vppctl set interface handoff $ACC workers 0-11 disable
+  vppctl show int features $ACC | grep -q worker-handoff && vppctl set interface handoff $ACC workers 0-\$((\$(vppctl show threads | grep -c vpp_wk) - 1)) disable
 fi
 for i in \$(echo $PORTS BondEthernet0 | tr ' ' '\n' | sort -u); do echo \"\$i handoff \$(vppctl show int features \$i | sed -n '/^device-input:/,/^\$/p' | grep -c worker-handoff)\"; done"
 bbq "sudo systemctl stop trex 2>/dev/null; sudo systemctl reset-failed trex 2>/dev/null; true"
 
 sec "1. $COUNT sessions through BNG Blaster"
+if [ -n "${N1:-}" ]; then
+  python3 $LAB/blaster/qinq-n1.py ${CFG_BASE:-$LAB/blaster/qinq-10k.json} "$COUNT" ${START_RATE:-1000} "${QINQ:?QINQ=...}" |
+    python3 -c "import json, sys; c = json.load(sys.stdin); c.pop('session-traffic', None); c['pppoe']['reconnect'] = False; print(json.dumps(c))" |
+    subst /dev/stdin | ssh $BB "cat > $R.json"
+else
 python3 - "${CFG_BASE:-$LAB/blaster/cap-pppoe.json}" "$COUNT" <<'EOF' | subst /dev/stdin | ssh $BB "cat > $R.json"
 import json, sys
 c = json.load(open(sys.argv[1]))
@@ -61,6 +75,7 @@ if "lag" in c["interfaces"]:
 c.pop("session-traffic", None)
 print(json.dumps(c, indent=4))
 EOF
+fi
 bbq "sudo rm -f $SOCK; sudo setsid nohup $BIN/bngblaster -C $R.json -S $SOCK -L $R.log -l info -b -f > $R.out 2>&1 < /dev/null &"
 for i in $(seq 1 100); do bbq "sudo test -S $SOCK" && break; sleep 0.3; done
 LAST=-1; SINCE=$SECONDS; T0=$SECONDS
@@ -112,13 +127,22 @@ scp -q $LAB/trex/pppoe-trex.py $BB:/tmp/pppoe-trex.py
 brq "vppctl set ip neighbor $NET.$NV 172.31.98.2 $TREX_MAC static; vppctl show ip neighbors $NET.$NV"
 
 sec "3. TRex"
-bbq "sudo systemd-run -q --unit=trex --working-directory=$TREX $TREX/t-rex-64 -i -c 16 --cfg /etc/trex_cfg.yaml --no-scapy-server --no-ofed-check"
+TCFG=/etc/trex_cfg.yaml; TCORES=16
+if [ ${REFLECT:-0} = 1 ]; then
+  # TRex keeps port 0 (and the first 8 cores), the reflector takes the network port and cores 18-32
+  bbq "sed 's/\"3b:00.1\"/\"dummy\"/' /etc/trex_cfg.yaml > /tmp/trex-reflect.yaml; grep interfaces /tmp/trex-reflect.yaml
+sudo systemctl stop reflect 2>/dev/null; sudo systemctl reset-failed reflect 2>/dev/null
+sudo systemd-run -q --unit=reflect dpdk-testpmd -l 18,20,22,24,26,28,30,32 --main-lcore 18 -a 0000:3b:00.1 --file-prefix reflect --socket-mem 2048 -- --forward-mode=5tswap --port-topology=loop --rxq=7 --txq=7 --nb-cores=7 --rxd=4096 --txd=4096 --rss-udp --auto-start --stats-period=60
+sleep 5; systemctl is-active reflect"
+  TCFG=/tmp/trex-reflect.yaml; TCORES=8
+fi
+bbq "sudo systemd-run -q --unit=trex --working-directory=$TREX $TREX/t-rex-64 -i -c $TCORES --cfg $TCFG --no-scapy-server --no-ofed-check"
 for i in $(seq 1 60); do bbq "ss -ltn | grep -q ':4501 '" && break; sleep 2; done
 sleep 5
 for t in "$@"; do
   read SIZE DIR MULT <<< "$t"
   sec "size $SIZE, $DIR, $MULT per port"
-  bbq "python3 /tmp/pppoe-trex.py /tmp/trex-sessions.json $SIZE $DIR $MULT $WINDOW > /tmp/trex-result.json 2>/tmp/trex-err.log" &
+  bbq "REFLECT=${REFLECT:-} FLOWS=${FLOWS:-} DSTNET=${DSTNET:-} python3 /tmp/pppoe-trex.py /tmp/trex-sessions.json $SIZE $DIR $MULT $WINDOW > /tmp/trex-result.json 2>/tmp/trex-err.log" &
   TREXPID=$!
   sleep 7
   brq "vppctl clear runtime; vppctl clear errors; vppctl clear hardware"; M0=$(missed)
@@ -127,8 +151,9 @@ for t in "$@"; do
 for i in $ACC $NET; do vppctl show hardware \$i | awk -v i=\$i '/rx_good_packets|tx_good_packets|rx_good_bytes|tx_good_bytes/ {v[\$1] = \$2} END {printf \"%-14s rx %6.2f Mpps %6.2f Gbps   tx %6.2f Mpps %6.2f Gbps   (avg over %ds)\\n\", i, v[\"rx_good_packets\"] / $((WINDOW - 3)) / 1e6, v[\"rx_good_bytes\"] * 8 / $((WINDOW - 3)) / 1e9, v[\"tx_good_packets\"] / $((WINDOW - 3)) / 1e6, v[\"tx_good_bytes\"] * 8 / $((WINDOW - 3)) / 1e9, $((WINDOW - 3))}'; done | sort -u
 vppctl show hardware $ACC | awk '\$1 ~ /^rx_q[0-9]+_packets\$/ {sub(/_packets/, \"\", \$1); printf \"%s %.2fM  \", \$1, \$2 / $((WINDOW - 3)) / 1e6} END {print \"pps per RX queue of $ACC\"}' | fold -w 200
 awk '/^Thread/ {t = \$3} /^  vector rates in/ {printf \"%-10s in %s\\n\", t, \$4}' /tmp/rt.txt | sed 's/,//' | paste -sd' ' | fold -w 200
-awk '\$1 == \"worker-handoff\" || \$1 == \"pppoe-input\" || \$1 == \"ip4-midchain\" || \$1 == \"policer-output\" || \$1 == \"policer-input\" {v[\$1] += \$3; c[\$1] += \$3 * \$6} END {for (k in v) if (v[k]) printf \"%-15s %12d vectors %7.1f clocks/pkt\\n\", k, v[k], c[k] / v[k]}' /tmp/rt.txt
-vppctl show errors | grep -vE '^\s+0 ' | grep -iE 'drop|full|miss|congest|no free|violate|exceed' | head -6"
+awk '\$2 == \"active\" && \$4 > 0 && \$1 != \"dpdk-input\" && !/^Thread 0/ {v[\$1] += \$4; c[\$1] += \$4 * \$6; t += \$4 * \$6} END {for (k in v) printf \"%-34s %7.1f%% of worker clocks %7.1f clk/pkt %12d pkts\\n\", k, 100 * c[k] / t, c[k] / v[k], v[k]}' /tmp/rt.txt | sort -k2 -rn | head -${TOPNODES:-12}
+vppctl show errors | grep -vE '^\s+0 ' | grep -iE 'drop|full|miss|congest|no free|violate|exceed|out of ports|max' | head -6
+[ ${NAT:-0} = 1 ] && vppctl show nat44 summary | grep -m1 '^total sessions'"
   echo "router NIC rx_missed: +$(( $(missed) - M0 ))"
   # not a bare wait: that also waits for the tee behind exec
   wait $TREXPID
@@ -140,12 +165,14 @@ for line in sys.stdin:
     except ValueError:
         print(line, end=''); continue
     print(json.dumps(r))
+    if 'reflected_mpps' in r:
+        print(f\"  reflected {r['reflected_mpps']} Mpps back to the access port, loss {r['reflected_loss_pct']}%\")
     for d in ('up', 'down'):
         if d + '_loss_pct' in r:
             print(f\"  {d:4} {r[d + '_mbps_per_session']:6} Mbit/s per session received (IP), loss {r[d + '_loss_pct']}%\")"
 done
 
 sec "4. Cleanup"
-bbq "sudo systemctl stop trex; sudo systemctl reset-failed trex 2>/dev/null; true"
+bbq "sudo systemctl stop trex reflect 2>/dev/null; sudo systemctl reset-failed trex reflect 2>/dev/null; true"
 brq "vppctl set ip neighbor del $NET.$NV 172.31.98.2 $TREX_MAC; $LABENV bash $BR_DIR/lab-phys-down.sh >/dev/null 2>&1; vppctl show pppoe session | head -1"
 shot

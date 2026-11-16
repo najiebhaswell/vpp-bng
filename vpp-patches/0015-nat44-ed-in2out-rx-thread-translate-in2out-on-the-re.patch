@@ -1,0 +1,127 @@
+From 90235fbc76cb129fdc61a522c75abcd8323c193f Mon Sep 17 00:00:00 2001
+From: najiebhaswell <25635833+najiebhaswell@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 09:33:04 +0700
+Subject: [PATCH] nat44-ed: in2out-rx-thread, translate in2out on the receiving
+ worker
+
+With several workers NAT44-ED hands every in2out packet off to the worker
+picked by a hash of the inside address. A PPPoE BNG already keeps a
+subscriber on one worker (handoff by client MAC, so the session policers
+stay on it too), and the NAT handoff then moves nearly every upstream
+packet a second time: about 12% of the worker cycles at 7 Mpps with 4M
+sessions.
+
+"nat44 plugin enable ... in2out-rx-thread" makes the output feature use
+nat-pre-in2out-output instead of the in2out handoff, so sessions are
+created on the worker the packet arrived on, with that worker's ports;
+out2in still hands off to the session owner. It needs all packets of a
+flow on one worker. A flow found on another worker is dropped and counted
+("flow on another worker") instead of being translated with the wrong
+session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/nat/nat44-ed/nat44_ed.c        |  8 ++++++--
+ src/plugins/nat/nat44-ed/nat44_ed.h        |  8 +++++++-
+ src/plugins/nat/nat44-ed/nat44_ed_cli.c    |  4 +++-
+ src/plugins/nat/nat44-ed/nat44_ed_in2out.c | 10 +++++++++-
+ 4 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed.c b/src/plugins/nat/nat44-ed/nat44_ed.c
+index 3c3c51fea..b3dea1d1f 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed.c
++++ b/src/plugins/nat/nat44-ed/nat44_ed.c
+@@ -1961,7 +1961,9 @@ nat44_ed_add_output_interface (u32 sw_if_index)
+       vnet_feature_enable_disable (
+ 	"ip4-unicast", "nat44-out2in-worker-handoff", sw_if_index, 1, 0, 0);
+       vnet_feature_enable_disable ("ip4-output",
+-				   "nat44-in2out-output-worker-handoff",
++				   sm->rconfig.in2out_rx_thread ?
++				     "nat-pre-in2out-output" :
++				     "nat44-in2out-output-worker-handoff",
+ 				   sw_if_index, 1, 0, 0);
+     }
+   else
+@@ -2056,7 +2058,9 @@ nat44_ed_del_output_interface (u32 sw_if_index)
+       vnet_feature_enable_disable (
+ 	"ip4-unicast", "nat44-out2in-worker-handoff", sw_if_index, 0, 0, 0);
+       vnet_feature_enable_disable ("ip4-output",
+-				   "nat44-in2out-output-worker-handoff",
++				   sm->rconfig.in2out_rx_thread ?
++				     "nat-pre-in2out-output" :
++				     "nat44-in2out-output-worker-handoff",
+ 				   sw_if_index, 0, 0, 0);
+     }
+   else
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed.h b/src/plugins/nat/nat44-ed/nat44_ed.h
+index 634599f2f..ddaed55f4 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed.h
++++ b/src/plugins/nat/nat44-ed/nat44_ed.h
+@@ -57,6 +57,11 @@ typedef struct
+   u32 inside_vrf;
+   u32 outside_vrf;
+   u32 sessions;
++  /* in2out-rx-thread: translate in2out on the worker the packet arrived
++   * on instead of handing it off by inside address. Only for setups that
++   * already keep all packets of a flow on one worker (RSS or a handoff by
++   * subscriber before NAT), so a PPPoE BNG avoids a second handoff. */
++  u8 in2out_rx_thread;
+ } nat44_config_t;
+ 
+ typedef enum
+@@ -86,7 +91,8 @@ typedef struct
+   _ (BAD_ICMP_TYPE, "unsupported ICMP type")                                  \
+   _ (MAX_SESSIONS_EXCEEDED, "maximum sessions exceeded")                      \
+   _ (NON_SYN, "non-SYN packet try to create session")                         \
+-  _ (TRNSL_FAILED, "couldn't translate packet")
++  _ (TRNSL_FAILED, "couldn't translate packet")                               \
++  _ (WRONG_THREAD, "flow on another worker (in2out-rx-thread)")
+ 
+ typedef enum
+ {
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed_cli.c b/src/plugins/nat/nat44-ed/nat44_ed_cli.c
+index c637c1a03..d503ef3d4 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed_cli.c
++++ b/src/plugins/nat/nat44-ed/nat44_ed_cli.c
+@@ -40,6 +40,8 @@ nat44_ed_enable_disable_command_fn (vlib_main_t *vm, unformat_input_t *input,
+ 	;
+       else if (unformat (line_input, "outside-vrf %u", &c.outside_vrf));
+       else if (unformat (line_input, "sessions %u", &c.sessions));
++      else if (unformat (line_input, "in2out-rx-thread"))
++	c.in2out_rx_thread = 1;
+       else if (!enable_set)
+ 	{
+ 	  enable_set = 1;
+@@ -1872,7 +1874,7 @@ VLIB_CLI_COMMAND (nat44_ed_enable_disable_command, static) = {
+   .function = nat44_ed_enable_disable_command_fn,
+   .short_help =
+     "nat44 plugin <enable [sessions <max-number>] [inside-vrf <vrf-id>] "
+-    "[outside-vrf <vrf-id>]>|disable",
++    "[outside-vrf <vrf-id>] [in2out-rx-thread]>|disable",
+ };
+ 
+ /*?
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed_in2out.c b/src/plugins/nat/nat44-ed/nat44_ed_in2out.c
+index 700f2691a..9a58f2cb3 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed_in2out.c
++++ b/src/plugins/nat/nat44-ed/nat44_ed_in2out.c
+@@ -1181,7 +1181,15 @@ nat44_ed_in2out_fast_path_node_fn_inline (vlib_main_t *vm,
+ 	  goto trace0;
+ 	}
+ 
+-      ASSERT (thread_index == ed_value_get_thread_index (&value0));
++      if (is_multi_worker &&
++	  PREDICT_FALSE (thread_index != ed_value_get_thread_index (&value0)))
++	{
++	  /* in2out-rx-thread and a flow whose packets do not all arrive on
++	   * one worker: its session belongs to another worker */
++	  next[0] = NAT_NEXT_DROP;
++	  b0->error = node->errors[NAT_IN2OUT_ED_ERROR_WRONG_THREAD];
++	  goto trace0;
++	}
+       s0 =
+ 	pool_elt_at_index (tsm->sessions,
+ 			   ed_value_get_session_index (&value0));
+-- 
+2.47.3
+
